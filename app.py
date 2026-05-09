@@ -664,12 +664,14 @@ def get_map_name(cfg=None):
         if cfg is None:
             cfg = read_config()
         sid = cfg.get("game", {}).get("scenarioId", "")
-        if sid:
-            for m in AVAILABLE_MISSIONS:
-                if m["id"] == sid:
-                    return m["name"]
-            return sid.split("/")[-1].replace(".conf", "")
-        return "Unknown"
+        if not sid:
+            return "Unknown"
+        # Consult the full merged list (vanilla + discovered, with overrides
+        # already applied) so the dashboard tile matches the dropdown.
+        for m in all_scenarios_cached():
+            if m["id"] == sid:
+                return m["name"]
+        return sid.split("/")[-1].replace(".conf", "")
     except Exception:
         return "Unknown"
 
