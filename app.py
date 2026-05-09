@@ -1,9 +1,20 @@
 """
 Arma Reforger Server Management Panel
 https://github.com/mateuszgolebiewski-code/arma-reforger-panel
+
+Local fork — modifications:
+  - Bcrypt-hashed admin password + constant-time verification + rate limiting
+  - CSRF protection on state-changing routes
+  - Persistent SECRET_KEY (sessions survive panel restart)
+  - Bulk mod import via pasted JSON array or uploaded JSON file
+  - Auto-discovery of scenarios from installed mods (`.pak` strings scan, mtime-cached)
 """
 
 from flask import Flask, request, jsonify, session, redirect, Response, send_from_directory
+import bcrypt
+import hmac
+import re
+import secrets
 import subprocess
 import os
 import json
@@ -26,20 +37,120 @@ def load_env(path="config.env"):
                 env[key.strip()] = val.strip().strip('"').strip("'")
     return env
 
-_cfg = load_env(os.path.join(os.path.dirname(__file__), "config.env"))
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_cfg = load_env(os.path.join(_BASE_DIR, "config.env"))
 
-PANEL_PASSWORD = _cfg.get("PANEL_PASSWORD", "changeme")
+# Backwards-compatible password handling: prefer the bcrypt hash; if only the
+# plaintext PANEL_PASSWORD is set (old configs), hash it in-memory at startup.
+PANEL_PASSWORD_HASH = _cfg.get("PANEL_PASSWORD_HASH", "").strip()
+_LEGACY_PLAINTEXT   = _cfg.get("PANEL_PASSWORD", "").strip()
+if not PANEL_PASSWORD_HASH and _LEGACY_PLAINTEXT:
+    PANEL_PASSWORD_HASH = bcrypt.hashpw(_LEGACY_PLAINTEXT.encode(), bcrypt.gensalt()).decode()
+    print("[panel] WARNING: config.env uses legacy plaintext PANEL_PASSWORD. "
+          "Re-run install.sh --update or replace it with PANEL_PASSWORD_HASH=...", flush=True)
+if not PANEL_PASSWORD_HASH:
+    PANEL_PASSWORD_HASH = bcrypt.hashpw(b"changeme", bcrypt.gensalt()).decode()
+    print("[panel] WARNING: no panel password set. Defaulting to 'changeme'.", flush=True)
+
 PANEL_PORT     = int(_cfg.get("PANEL_PORT", 8888))
 SERVER_DIR     = _cfg.get("SERVER_DIR",    "/home/arma/server")
 SERVER_CONFIG  = _cfg.get("SERVER_CONFIG", "/home/arma/server/config.json")
 LOG_DIR        = _cfg.get("LOG_DIR",       "/home/arma/.config/ArmaReforger/logs")
+WORKSHOP_DIR   = _cfg.get("WORKSHOP_DIR",  os.path.expanduser("~/.local/share/Arma Reforger/addons"))
 SERVER_BINARY  = "./ArmaReforgerServer"
 SERVER_ARGS    = ["-config", SERVER_CONFIG] + (
     [f"-maxFPS={_cfg['MAX_FPS']}"] if _cfg.get("MAX_FPS") else []
 )
 
+# Persistent secret key so sessions survive panel restarts.
+_SECRET_FILE = os.path.join(_BASE_DIR, ".panel-secret")
+def _load_or_create_secret():
+    try:
+        if os.path.exists(_SECRET_FILE):
+            with open(_SECRET_FILE, "rb") as f:
+                data = f.read().strip()
+                if len(data) >= 32:
+                    return data
+    except OSError:
+        pass
+    data = secrets.token_bytes(48)
+    try:
+        with open(_SECRET_FILE, "wb") as f:
+            f.write(data)
+        os.chmod(_SECRET_FILE, 0o600)
+    except OSError as e:
+        print(f"[panel] WARNING: could not persist session secret ({e}); using ephemeral one.", flush=True)
+    return data
+
 app = Flask(__name__, static_folder='static')
-app.secret_key = os.urandom(24)
+app.secret_key = _load_or_create_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=False,  # set True if you put HTTPS in front
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,  # 2 MB cap on uploads
+)
+
+
+# ─── SECURITY HELPERS ─────────────────────────────────────────────────────────
+
+def _client_ip():
+    # Honor X-Forwarded-For only when behind a reverse proxy; otherwise use remote_addr
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip() or "unknown"
+
+
+_LOGIN_BUCKETS: dict[str, list[float]] = {}
+_LOGIN_WINDOW_SEC = 60.0
+_LOGIN_MAX_ATTEMPTS = 5
+
+def _login_rate_ok(ip: str) -> bool:
+    now = time.time()
+    bucket = [t for t in _LOGIN_BUCKETS.get(ip, []) if now - t < _LOGIN_WINDOW_SEC]
+    if len(bucket) >= _LOGIN_MAX_ATTEMPTS:
+        _LOGIN_BUCKETS[ip] = bucket
+        return False
+    bucket.append(now)
+    _LOGIN_BUCKETS[ip] = bucket
+    return True
+
+
+def _verify_password(plain: str) -> bool:
+    if not plain:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), PANEL_PASSWORD_HASH.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
+def _ensure_csrf() -> str:
+    tok = session.get("csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        session["csrf"] = tok
+    return tok
+
+
+def _csrf_required() -> Response | None:
+    """Check CSRF token from header or body. Returns an error Response or None."""
+    expected = session.get("csrf")
+    supplied = (
+        request.headers.get("X-CSRF-Token", "")
+        or (request.get_json(silent=True) or {}).get("_csrf", "")
+        or request.form.get("_csrf", "")
+    )
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        return jsonify({"ok": False, "error": "CSRF token invalid"}), 403
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
 
 # ─── MISSIONS ─────────────────────────────────────────────────────────────────
 
@@ -93,6 +204,135 @@ AVAILABLE_MISSIONS = [
     {"id": "{68A6FBF43B801FF6}Missions/RHS_ShowcaseBasic.conf",         "name": "RHS — Showcase Mission"},
     {"id": "{217436B52D34E4BD}Missions/RHS_Showcase_GM.conf",           "name": "RHS — Showcase Mission (Game Master)"},
 ]
+# Add a "source" tag so the UI can group by origin.
+for _m in AVAILABLE_MISSIONS:
+    _m.setdefault("source", "vanilla")
+
+
+# ─── SCENARIO AUTO-DISCOVERY (mod .pak scan) ──────────────────────────────────
+#
+# Reforger workshop mods unpack to <WORKSHOP_DIR>/<Name>_<HEXID>/data.pak.
+# `data.pak` is a binary IFF file but `strings` reliably finds scenario IDs
+# embedded as `{HEX16}Missions/Path/Name.conf`. We cache results per .pak by
+# mtime to avoid rescanning every page load.
+
+_SCENARIO_RE = re.compile(rb'\{([0-9A-Fa-f]{16})\}(Missions/[A-Za-z0-9_./\-]+\.conf)')
+_SCAN_CACHE_FILE = os.path.join(_BASE_DIR, ".scenario-cache.json")
+
+
+def _scan_cache_load():
+    try:
+        with open(_SCAN_CACHE_FILE) as f:
+            data = json.load(f)
+        return data.get("mods", {}), data.get("mtimes", {})
+    except (OSError, json.JSONDecodeError):
+        return {}, {}
+
+
+def _scan_cache_save(mods, mtimes):
+    try:
+        with open(_SCAN_CACHE_FILE, "w") as f:
+            json.dump({"mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
+    except OSError as e:
+        print(f"[panel] WARNING: could not write scenario cache: {e}", flush=True)
+
+
+def _mod_label_from_dir(mod_dir):
+    """Best-effort friendly name from <mod_dir>/meta JSON, falling back to dir basename."""
+    meta = os.path.join(mod_dir, "meta")
+    if os.path.isfile(meta):
+        try:
+            with open(meta, encoding="utf-8-sig") as f:
+                data = json.load(f)
+            name = (data.get("meta") or {}).get("name")
+            if name:
+                return str(name)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    base = os.path.basename(mod_dir)
+    parts = base.rsplit("_", 1)
+    if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789ABCDEFabcdef" for c in parts[1]):
+        return parts[0]
+    return base
+
+
+def _strings_extract(pak_path):
+    """Run `strings` over a .pak and return a deduped list of scenario IDs found."""
+    try:
+        proc = subprocess.run(
+            ["strings", "-a", "-n", "8", pak_path],
+            capture_output=True, timeout=120, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    found = {}
+    for m in _SCENARIO_RE.finditer(proc.stdout):
+        gid = m.group(1).decode("ascii").upper()
+        path = m.group(2).decode("ascii")
+        sid = "{" + gid + "}" + path
+        found.setdefault(sid, sid)
+    return list(found.keys())
+
+
+def discover_mod_scenarios(force_rescan=False):
+    """Return list[{id, name, source}] discovered from installed mods (cached)."""
+    if not WORKSHOP_DIR or not os.path.isdir(WORKSHOP_DIR):
+        return []
+
+    cache_mods, cache_mtimes = ({}, {}) if force_rescan else _scan_cache_load()
+    fresh_mods = {}
+    fresh_mtimes = {}
+
+    try:
+        entries = sorted(os.listdir(WORKSHOP_DIR))
+    except OSError:
+        return []
+
+    for name in entries:
+        mod_dir = os.path.join(WORKSHOP_DIR, name)
+        if not os.path.isdir(mod_dir):
+            continue
+        pak = os.path.join(mod_dir, "data.pak")
+        if not os.path.isfile(pak):
+            continue
+        try:
+            mtime = os.path.getmtime(pak)
+        except OSError:
+            continue
+
+        if cache_mtimes.get(name) == mtime and name in cache_mods:
+            fresh_mods[name] = cache_mods[name]
+            fresh_mtimes[name] = mtime
+            continue
+
+        label = _mod_label_from_dir(mod_dir)
+        sids = _strings_extract(pak)
+        if sids:
+            fresh_mods[name] = [
+                {"id": sid, "name": sid.split("/")[-1].replace(".conf", ""), "source": label}
+                for sid in sids
+            ]
+        fresh_mtimes[name] = mtime
+
+    _scan_cache_save(fresh_mods, fresh_mtimes)
+
+    flat = []
+    for sids in fresh_mods.values():
+        flat.extend(sids)
+    return flat
+
+
+def all_scenarios(force_rescan=False):
+    """Vanilla list + auto-discovered, deduped by id (vanilla wins for naming)."""
+    by_id = {}
+    for s in AVAILABLE_MISSIONS:
+        by_id[s["id"]] = dict(s)
+    for s in discover_mod_scenarios(force_rescan=force_rescan):
+        by_id.setdefault(s["id"], dict(s))
+    out = list(by_id.values())
+    out.sort(key=lambda s: (s["source"] != "vanilla", s["source"], s["name"]))
+    return out
+
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -193,15 +433,25 @@ def service_worker():
 def index():
     if not session.get("logged_in"):
         return redirect("/login")
+    _ensure_csrf()
     return open(os.path.join(os.path.dirname(__file__), "index.html")).read()
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
+        ip = _client_ip()
+        if not _login_rate_ok(ip):
+            return jsonify({"ok": False, "error": "Too many attempts. Wait a minute."}), 429
         data = request.get_json(silent=True) or {}
-        if data.get("password") == PANEL_PASSWORD:
+        # bcrypt is intentionally slow — even on a successful login it adds ~100ms,
+        # which is also a natural defense against brute force.
+        if _verify_password(data.get("password", "")):
+            session.clear()
+            session.permanent = True
             session["logged_in"] = True
-            return jsonify({"ok": True})
+            session["login_at"] = int(time.time())
+            _ensure_csrf()
+            return jsonify({"ok": True, "csrf": session["csrf"]})
         return jsonify({"ok": False, "error": "Invalid password"}), 401
     return open(os.path.join(os.path.dirname(__file__), "login.html")).read()
 
@@ -209,6 +459,13 @@ def login():
 def logout():
     session.clear()
     return jsonify({"ok": True})
+
+@app.route("/api/csrf")
+def api_csrf():
+    """Front-end fetches a CSRF token after login and on tab refresh."""
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"csrf": _ensure_csrf()})
 
 @app.route("/api/status")
 def api_status():
@@ -218,6 +475,7 @@ def api_status():
     cfg = read_config()
     cpu, ram = get_cpu_ram(pid) if pid else (0.0, 0.0)
     ram_used, ram_total = get_system_ram()
+    missions = all_scenarios()
     return jsonify({
         "running":        pid is not None,
         "pid":            pid,
@@ -229,7 +487,9 @@ def api_status():
         "ip":             cfg.get("publicAddress", "—"),
         "port":           cfg.get("publicPort", "—"),
         "scenario_id":    cfg.get("game", {}).get("scenarioId", ""),
-        "missions":       AVAILABLE_MISSIONS,
+        "missions":       missions,
+        "missions_count": {"vanilla": sum(1 for m in missions if m.get("source") == "vanilla"),
+                           "from_mods": sum(1 for m in missions if m.get("source") != "vanilla")},
         "password":       cfg.get("game", {}).get("password", ""),
         "password_admin": cfg.get("game", {}).get("passwordAdmin", ""),
         "cpu":            cpu,
@@ -237,6 +497,22 @@ def api_status():
         "ram_used":       ram_used,
         "ram_total":      ram_total,
         "mods":           cfg.get("game", {}).get("mods", []),
+        "csrf":           _ensure_csrf(),
+    })
+
+@app.route("/api/scenarios/rescan", methods=["POST"])
+def api_scenarios_rescan():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    missions = all_scenarios(force_rescan=True)
+    return jsonify({
+        "ok": True,
+        "missions": missions,
+        "missions_count": {"vanilla": sum(1 for m in missions if m.get("source") == "vanilla"),
+                           "from_mods": sum(1 for m in missions if m.get("source") != "vanilla")},
+        "workshop_dir": WORKSHOP_DIR,
     })
 
 @app.route("/api/metrics")
@@ -266,24 +542,50 @@ def api_logs():
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)})
 
+def _normalize_mod_entry(entry):
+    """Validate one mod row. Returns canonical dict or None."""
+    if not isinstance(entry, dict):
+        return None
+    mod_id = str(entry.get("modId", "")).strip()
+    if not mod_id or len(mod_id) > 32:
+        return None
+    if not all(c in "0123456789ABCDEFabcdef" for c in mod_id):
+        return None
+    out = {"modId": mod_id.upper()}
+    name = str(entry.get("name", "")).strip()
+    if name:
+        if len(name) > 200 or any(c in name for c in "\n\r"):
+            return None
+        out["name"] = name
+    version = str(entry.get("version", "")).strip()
+    if version:
+        if len(version) > 32 or any(c in version for c in '\n\r"\\'):
+            return None
+        out["version"] = version
+    return out
+
+
 @app.route("/api/config", methods=["POST"])
 def api_config():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     data = request.get_json(silent=True) or {}
     cfg  = read_config()
     changed = False
     if "server_name" in data and data["server_name"].strip():
-        cfg["game"]["name"] = data["server_name"].strip(); changed = True
+        cfg.setdefault("game", {})["name"] = data["server_name"].strip(); changed = True
     if "scenario_id" in data:
         sid = data["scenario_id"].strip()
-        if sid not in [m["id"] for m in AVAILABLE_MISSIONS]:
+        valid_ids = {m["id"] for m in all_scenarios()}
+        if sid not in valid_ids:
             return jsonify({"ok": False, "error": "Unknown scenario"})
-        cfg["game"]["scenarioId"] = sid; changed = True
+        cfg.setdefault("game", {})["scenarioId"] = sid; changed = True
     if "password" in data:
-        cfg["game"]["password"] = data["password"]; changed = True
+        cfg.setdefault("game", {})["password"] = data["password"]; changed = True
     if "password_admin" in data and data["password_admin"].strip():
-        cfg["game"]["passwordAdmin"] = data["password_admin"].strip(); changed = True
+        cfg.setdefault("game", {})["passwordAdmin"] = data["password_admin"].strip(); changed = True
     if not changed:
         return jsonify({"ok": False, "error": "No changes"})
     try:
@@ -296,46 +598,133 @@ def api_config():
 def api_mods_add():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     data = request.get_json(silent=True) or {}
-    mod_id, mod_name, mod_ver = (
-        data.get("modId","").strip(),
-        data.get("name","").strip(),
-        data.get("version","").strip()
-    )
-    if not mod_id or not mod_name:
-        return jsonify({"ok": False, "error": "modId and name are required"})
+    norm = _normalize_mod_entry({"modId": data.get("modId",""), "name": data.get("name",""), "version": data.get("version","")})
+    if not norm:
+        return jsonify({"ok": False, "error": "Invalid mod entry (modId must be 1-32 hex chars)"})
+    if "name" not in norm:
+        return jsonify({"ok": False, "error": "name is required for manual entry"})
     cfg  = read_config()
-    mods = cfg.get("game", {}).get("mods", [])
-    if any(m.get("modId") == mod_id for m in mods):
+    mods = cfg.setdefault("game", {}).setdefault("mods", [])
+    if any(m.get("modId", "").upper() == norm["modId"] for m in mods):
         return jsonify({"ok": False, "error": "Mod with this ID already exists"})
-    new_mod = {"modId": mod_id, "name": mod_name}
-    if mod_ver:
-        new_mod["version"] = mod_ver
-    mods.append(new_mod)
-    cfg["game"]["mods"] = mods
+    mods.append(norm)
     try:
         write_config(cfg)
-        return jsonify({"ok": True, "restart_required": get_server_pid() is not None})
+        return jsonify({"ok": True, "restart_required": get_server_pid() is not None, "mods": mods})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/mods/import", methods=["POST"])
+def api_mods_import():
+    """Bulk-import mods. Accepts either:
+       - multipart/form-data with a 'file' part containing a JSON array, plus
+         form fields 'mode' (replace|merge) and '_csrf'.
+       - application/json with {payload: <text or array>, mode, _csrf}.
+    """
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+
+    raw = None
+    mode = "replace"
+
+    if request.files and "file" in request.files:
+        f = request.files["file"]
+        try:
+            raw = f.read().decode("utf-8")
+        except UnicodeDecodeError:
+            return jsonify({"ok": False, "error": "File must be UTF-8 encoded JSON"}), 400
+        mode = (request.form.get("mode") or "replace").strip().lower()
+    else:
+        body = request.get_json(silent=True) or {}
+        payload = body.get("payload")
+        if isinstance(payload, list):
+            raw = json.dumps(payload)
+        elif isinstance(payload, str):
+            raw = payload
+        mode = (body.get("mode") or "replace").strip().lower()
+
+    if mode not in ("replace", "merge"):
+        return jsonify({"ok": False, "error": "mode must be 'replace' or 'merge'"}), 400
+    if not raw or not raw.strip():
+        return jsonify({"ok": False, "error": "Empty payload"}), 400
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return jsonify({"ok": False, "error": f"Invalid JSON: {e.msg} at line {e.lineno} col {e.colno}"}), 400
+    if not isinstance(data, list):
+        return jsonify({"ok": False, "error": "Top-level value must be a JSON array"}), 400
+
+    valid = []
+    skipped = []
+    seen = set()
+    for i, entry in enumerate(data):
+        norm = _normalize_mod_entry(entry)
+        if not norm:
+            skipped.append(f"#{i + 1}: invalid")
+            continue
+        if norm["modId"] in seen:
+            skipped.append(f"#{i + 1}: duplicate modId {norm['modId']}")
+            continue
+        seen.add(norm["modId"])
+        valid.append(norm)
+
+    cfg = read_config()
+    g   = cfg.setdefault("game", {})
+
+    if mode == "merge":
+        existing = list(g.get("mods", []))
+        existing_ids = {str(m.get("modId", "")).upper() for m in existing}
+        added = 0
+        for m in valid:
+            if m["modId"] not in existing_ids:
+                existing.append(m)
+                existing_ids.add(m["modId"])
+                added += 1
+        g["mods"] = existing
+        msg = f"Merged: {added} added, {len(valid) - added} already present"
+    else:
+        g["mods"] = valid
+        msg = f"Replaced full mod list with {len(valid)} entries"
+
+    try:
+        write_config(cfg)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "message": msg,
+        "imported": len(valid),
+        "skipped": skipped,
+        "mods": g["mods"],
+        "restart_required": get_server_pid() is not None,
+    })
 
 @app.route("/api/mods/remove", methods=["POST"])
 def api_mods_remove():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     data   = request.get_json(silent=True) or {}
-    mod_id = data.get("modId", "").strip()
+    mod_id = data.get("modId", "").strip().upper()
     if not mod_id:
         return jsonify({"ok": False, "error": "Missing modId"})
     cfg  = read_config()
     mods = cfg.get("game", {}).get("mods", [])
-    new  = [m for m in mods if m.get("modId") != mod_id]
+    new  = [m for m in mods if str(m.get("modId", "")).upper() != mod_id]
     if len(new) == len(mods):
         return jsonify({"ok": False, "error": "Mod not found"})
-    cfg["game"]["mods"] = new
+    cfg.setdefault("game", {})["mods"] = new
     try:
         write_config(cfg)
-        return jsonify({"ok": True, "restart_required": get_server_pid() is not None})
+        return jsonify({"ok": True, "restart_required": get_server_pid() is not None, "mods": new})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -343,6 +732,8 @@ def api_mods_remove():
 def api_start():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     if get_server_pid():
         return jsonify({"ok": False, "error": "Server is already running"})
     try:
@@ -358,6 +749,8 @@ def api_start():
 def api_stop():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     pid = get_server_pid()
     if not pid:
         return jsonify({"ok": False, "error": "Server is not running"})
@@ -371,6 +764,8 @@ def api_stop():
 def api_restart():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
     pid = get_server_pid()
     if pid:
         try:

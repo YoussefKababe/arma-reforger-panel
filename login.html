@@ -70,16 +70,23 @@ h1 span { color: var(--accent); }
 async function doLogin() {
   const pwd = document.getElementById('pwd').value;
   const err = document.getElementById('err');
-  const r = await fetch('/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: pwd })
-  });
-  if (r.ok) { window.location.href = '/'; }
-  else {
-    err.textContent = 'Invalid password';
+  const btn = document.querySelector('.btn');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwd })
+    });
+    if (r.ok) { window.location.href = '/'; return; }
+    let msg = 'Invalid password';
+    if (r.status === 429) msg = 'Too many attempts — wait a minute and retry';
+    try { const d = await r.json(); if (d && d.error) msg = d.error; } catch(e) {}
+    err.textContent = msg;
     document.getElementById('pwd').style.borderColor = '#d64c4c';
     setTimeout(() => { err.textContent = ''; document.getElementById('pwd').style.borderColor = ''; }, 2500);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js').catch(() => {});

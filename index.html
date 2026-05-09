@@ -494,7 +494,14 @@
         <input type="text" id="input-name" placeholder="np. LEM Arma" maxlength="64" />
       </div>
       <div class="field-group">
-        <label for="input-mission">Scenario / Mission</label>
+        <label for="input-mission" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span>Scenario / Mission</span>
+          <span id="scenario-source-badge" style="font-size:10px;letter-spacing:0.1em;color:var(--muted);font-weight:400;text-transform:none;"></span>
+          <button type="button" id="btn-rescan-scenarios" onclick="rescanScenarios()"
+            style="margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--muted);font-size:10px;letter-spacing:0.15em;text-transform:uppercase;padding:4px 10px;cursor:pointer;font-family:inherit;">
+            Rescan from mods
+          </button>
+        </label>
         <select id="input-mission"></select>
       </div>
       <div class="field-group">
@@ -519,16 +526,39 @@
       <div style="color:var(--muted);font-size:13px">Loading mods...</div>
     </div>
 
-    <!-- Formularz dodawania -->
+    <!-- Bulk import (paste JSON or upload file) -->
     <div style="border-top:1px solid var(--border);padding-top:16px;margin-top:4px;">
-      <div style="font-size:10px;font-weight:600;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;">Add new mod</div>
+      <div style="font-size:10px;font-weight:600;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;">Bulk import</div>
+      <textarea id="mods-import-text" rows="6" maxlength="200000" placeholder='[
+  { "modId": "595F2BF2F44836FB", "name": "RHS - Status Quo", "version": "0.14.4899" }
+]' style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:11.5px;padding:10px;line-height:1.5;resize:vertical;outline:none;"></textarea>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;">
+        <select id="mods-import-mode" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;font-size:12px;">
+          <option value="replace">Replace full list</option>
+          <option value="merge">Merge with existing</option>
+        </select>
+        <button class="btn-save" type="button" onclick="importModsFromTextarea()" style="margin:0;flex:0 0 auto;">Import pasted JSON</button>
+        <label class="btn-save" style="margin:0;cursor:pointer;flex:0 0 auto;background:transparent;border:1px solid var(--border);color:var(--text);">
+          Upload .json file
+          <input type="file" id="mods-import-file" accept="application/json,.json" onchange="importModsFromFile(this)" style="display:none;" />
+        </label>
+      </div>
+      <div style="font-size:10.5px;color:var(--muted);margin-top:8px;line-height:1.5;">
+        Format: a JSON array of <code>{ "modId": "&lt;hex&gt;", "name": "&lt;optional&gt;", "version": "&lt;optional&gt;" }</code>.
+        File limit 2 MB. Replace overwrites the whole mod list; merge adds missing entries only.
+      </div>
+    </div>
+
+    <!-- Single-add form -->
+    <div style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px;">
+      <div style="font-size:10px;font-weight:600;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;">Add a single mod</div>
       <div class="config-grid">
         <div class="field-group">
           <label for="mod-id">Mod ID <span style="color:var(--offline)">*</span></label>
           <input type="text" id="mod-id" placeholder="e.g. 595F2BF2F44836FB" maxlength="64" />
         </div>
         <div class="field-group">
-          <label for="mod-name">Name moda <span style="color:var(--offline)">*</span></label>
+          <label for="mod-name">Name <span style="color:var(--offline)">*</span></label>
           <input type="text" id="mod-name" placeholder="e.g. RHS - Status Quo" maxlength="128" />
         </div>
         <div class="field-group">
@@ -566,6 +596,42 @@
 </div>
 
 <script>
+// ─── CSRF + fetch helpers ────────────────────────────────────────────────────
+let CSRF = '';
+
+async function postJson(url, body) {
+  if (!CSRF) {
+    try { const r = await fetch('/api/csrf'); if (r.ok) CSRF = (await r.json()).csrf || ''; }
+    catch(e) {}
+  }
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+    body: JSON.stringify({ ...(body || {}), _csrf: CSRF }),
+  });
+  if (r.status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
+  if (r.status === 403) {
+    // CSRF expired — refresh token and surface error
+    try { const cr = await fetch('/api/csrf'); if (cr.ok) CSRF = (await cr.json()).csrf || ''; } catch(e) {}
+  }
+  return r;
+}
+
+async function postForm(url, formData) {
+  if (!CSRF) {
+    try { const r = await fetch('/api/csrf'); if (r.ok) CSRF = (await r.json()).csrf || ''; }
+    catch(e) {}
+  }
+  formData.append('_csrf', CSRF);
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': CSRF },
+    body: formData,
+  });
+  if (r.status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
+  return r;
+}
+
 // ─── Charts setup ────────────────────────────────────────────────────────────
 const MAX_POINTS = 60;
 
@@ -762,18 +828,64 @@ function updateUI(d) {
   const pwdAdminInput = document.getElementById('input-password-admin');
   if (document.activeElement !== pwdAdminInput) pwdAdminInput.value = d.password_admin || '';
 
-  const sel = document.getElementById('input-mission');
-  if (sel.options.length === 0 && d.missions) {
-    d.missions.forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m.id; opt.textContent = m.name;
-      sel.appendChild(opt);
-    });
-  }
-  if (d.scenario_id) sel.value = d.scenario_id;
+  if (d.csrf) CSRF = d.csrf;
+  renderMissionSelect(d.missions || [], d.missions_count, d.scenario_id);
 
   // Render listy modów
   renderMods(d.mods || []);
+}
+
+function renderMissionSelect(missions, counts, currentId) {
+  const sel = document.getElementById('input-mission');
+  // Always rebuild — discovered scenarios can change as the workshop populates.
+  const prev = sel.value || currentId || '';
+  sel.innerHTML = '';
+  // Group by source: vanilla first, then per-mod alphabetical.
+  const groups = {};
+  missions.forEach(m => {
+    const key = m.source || 'vanilla';
+    (groups[key] = groups[key] || []).push(m);
+  });
+  const sourceKeys = Object.keys(groups).sort((a, b) => {
+    if (a === 'vanilla') return -1;
+    if (b === 'vanilla') return 1;
+    return a.localeCompare(b);
+  });
+  sourceKeys.forEach(src => {
+    const og = document.createElement('optgroup');
+    og.label = src === 'vanilla' ? 'Base game' : src;
+    groups[src].forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.name;
+      og.appendChild(opt);
+    });
+    sel.appendChild(og);
+  });
+  if (prev) sel.value = prev;
+
+  // Update the badge near the select if present.
+  const badge = document.getElementById('scenario-source-badge');
+  if (badge && counts) {
+    badge.textContent = `${counts.vanilla} vanilla · ${counts.from_mods} from mods`;
+  }
+}
+
+async function rescanScenarios() {
+  const btn = document.getElementById('btn-rescan-scenarios');
+  if (btn) btn.disabled = true;
+  setLog('Scanning installed mods for scenarios…', 'info');
+  try {
+    const r = await postJson('/api/scenarios/rescan', {});
+    const d = await r.json();
+    if (d.ok) {
+      renderMissionSelect(d.missions, d.missions_count);
+      setLog(`Scanned. Vanilla: ${d.missions_count.vanilla} · From mods: ${d.missions_count.from_mods}`, 'ok');
+    } else {
+      setLog('Rescan failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch(e) { setLog('Rescan error', 'error'); }
+  if (btn) btn.disabled = false;
 }
 
 function renderMods(mods) {
@@ -815,49 +927,90 @@ async function addMod() {
   const modId   = document.getElementById('mod-id').value.trim();
   const modName = document.getElementById('mod-name').value.trim();
   const modVer  = document.getElementById('mod-version').value.trim();
-  if (!modId)   { setLog('Mod ID jest wymagany', 'error'); return; }
-  if (!modName) { setLog('Name moda jest wymagana', 'error'); return; }
+  if (!modId)   { setLog('Mod ID is required', 'error'); return; }
+  if (!modName) { setLog('Mod name is required', 'error'); return; }
   document.getElementById('btn-add-mod').disabled = true;
-  setLog('Dodawanie moda...', 'info');
+  setLog('Adding mod…', 'info');
   try {
-    const r = await fetch('/api/mods/add', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ modId, name: modName, version: modVer })
-    });
+    const r = await postJson('/api/mods/add', { modId, name: modName, version: modVer });
     const d = await r.json();
     if (d.ok) {
-      setLog(`Mod "${modName}" dodany`, 'ok');
+      setLog(`Mod "${modName}" added`, 'ok');
       document.getElementById('mod-id').value = '';
       document.getElementById('mod-name').value = '';
       document.getElementById('mod-version').value = '';
       document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
       await fetchStatus();
     } else {
-      setLog('Błąd: ' + (d.error || 'nieznany'), 'error');
+      setLog('Error: ' + (d.error || 'unknown'), 'error');
     }
-  } catch(e) { setLog('Błąd połączenia', 'error'); }
+  } catch(e) { setLog('Connection error', 'error'); }
   document.getElementById('btn-add-mod').disabled = false;
 }
 
 async function removeMod(modId) {
-  if (!confirm('Usunąć ten mod z konfiguracji?')) return;
-  setLog('Usuwanie moda...', 'info');
+  if (!confirm('Remove this mod from the configuration?')) return;
+  setLog('Removing mod…', 'info');
   try {
-    const r = await fetch('/api/mods/remove', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ modId })
-    });
+    const r = await postJson('/api/mods/remove', { modId });
     const d = await r.json();
     if (d.ok) {
-      setLog('Mod usunięty', 'ok');
+      setLog('Mod removed', 'ok');
       document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
       await fetchStatus();
     } else {
-      setLog('Błąd: ' + (d.error || 'nieznany'), 'error');
+      setLog('Error: ' + (d.error || 'unknown'), 'error');
     }
-  } catch(e) { setLog('Błąd połączenia', 'error'); }
+  } catch(e) { setLog('Connection error', 'error'); }
+}
+
+// ─── Bulk import (paste or file upload) ──────────────────────────────────────
+async function importModsFromTextarea() {
+  const txt = document.getElementById('mods-import-text').value;
+  if (!txt.trim()) { setLog('Paste a JSON array first', 'error'); return; }
+  const mode = document.getElementById('mods-import-mode').value;
+  await _importMods({ payload: txt, mode });
+}
+
+async function importModsFromFile(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  if (f.size > 2 * 1024 * 1024) { setLog('File too large (max 2 MB)', 'error'); return; }
+  const mode = document.getElementById('mods-import-mode').value;
+  setLog(`Uploading ${f.name}…`, 'info');
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  fd.append('mode', mode);
+  try {
+    const r = await postForm('/api/mods/import', fd);
+    const d = await r.json();
+    _afterImport(d);
+  } catch(e) { setLog('Upload error', 'error'); }
+  input.value = '';
+}
+
+async function _importMods(body) {
+  setLog('Importing mods…', 'info');
+  try {
+    const r = await postJson('/api/mods/import', body);
+    const d = await r.json();
+    _afterImport(d);
+  } catch(e) { setLog('Connection error', 'error'); }
+}
+
+function _afterImport(d) {
+  if (d.ok) {
+    let msg = d.message || `${d.imported} mods imported`;
+    if (d.skipped && d.skipped.length) {
+      msg += ` (${d.skipped.length} skipped: ${d.skipped.slice(0, 3).join('; ')}${d.skipped.length > 3 ? '…' : ''})`;
+    }
+    setLog(msg, 'ok');
+    document.getElementById('mods-import-text').value = '';
+    document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
+    fetchStatus();
+  } else {
+    setLog('Import failed: ' + (d.error || 'unknown'), 'error');
+  }
 }
 
 function setLog(msg, type = 'info') {
@@ -879,7 +1032,7 @@ async function serverAction(action) {
   setBusy(true);
   setLog(labels[action], 'info');
   try {
-    const r = await fetch('/api/' + action, { method: 'POST' });
+    const r = await postJson('/api/' + action, {});
     if (r.status === 401) { window.location.href = '/login'; return; }
     const d = await r.json();
     if (d.ok) {
@@ -906,12 +1059,7 @@ async function saveConfig() {
   setBusy(true);
   setLog('Zapisywanie konfiguracji...', 'info');
   try {
-    const r = await fetch('/api/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ server_name: name, scenario_id: scenario, password, password_admin: pwdAdmin })
-    });
-    if (r.status === 401) { window.location.href = '/login'; return; }
+    const r = await postJson('/api/config', { server_name: name, scenario_id: scenario, password, password_admin: pwdAdmin });
     const d = await r.json();
     if (d.ok) {
       setLog('Konfiguracja zapisana', 'ok');

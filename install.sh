@@ -184,8 +184,8 @@ if [[ "$MODE" == "full" ]]; then
     echo -e "${YELLOW}[2/6] Installing system dependencies...${NC}"
     dpkg --add-architecture i386
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip curl lib32gcc-s1 iptables-persistent
-    pip3 install flask --break-system-packages -q
+    apt-get install -y -qq python3 python3-pip curl lib32gcc-s1 iptables-persistent binutils
+    pip3 install flask bcrypt --break-system-packages -q
     echo -e "      ${GREEN}✓ Done.${NC}"
 
     # Step 3: SteamCMD
@@ -288,8 +288,8 @@ echo -e "${YELLOW}[${PANEL_STEP}/${TOTAL_STEPS}] Installing management panel...$
 # Dependencies (panel-only mode)
 if [[ "$MODE" == "panel" ]]; then
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip iptables-persistent
-    pip3 install flask --break-system-packages -q
+    apt-get install -y -qq python3 python3-pip iptables-persistent binutils
+    pip3 install flask bcrypt --break-system-packages -q
 fi
 
 mkdir -p "$PANEL_DIR/static"
@@ -308,12 +308,24 @@ for f in manifest.json service-worker.js icon-192.png icon-512.png; do
     fi
 done
 
+# Hash the panel password with bcrypt so it isn't stored in plaintext.
+# Falls back to plaintext only if bcrypt isn't available (shouldn't happen).
+PANEL_PASSWORD_HASH=$(python3 -c "
+import bcrypt, sys
+print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt()).decode())
+" "$PANEL_PASSWORD" 2>/dev/null || true)
+
+# Default workshop dir for the addons that the Reforger server downloads.
+WORKSHOP_DIR="${ARMA_HOME}/.local/share/Arma Reforger/addons"
+
 cat > "$PANEL_DIR/config.env" << EOF
-PANEL_PASSWORD=${PANEL_PASSWORD}
+# bcrypt-hashed admin password. Generated at install time.
+PANEL_PASSWORD_HASH=${PANEL_PASSWORD_HASH}
 PANEL_PORT=${PANEL_PORT}
 SERVER_DIR=${SERVER_DIR}
 SERVER_CONFIG=${SERVER_CONFIG}
 LOG_DIR=${LOG_DIR}
+WORKSHOP_DIR=${WORKSHOP_DIR}
 MAX_FPS=${MAX_FPS}
 EOF
 chmod 600 "$PANEL_DIR/config.env"
@@ -364,7 +376,7 @@ echo ""
 fi
 echo -e "  ${BOLD}Management Panel:${NC}"
 echo -e "    URL      : ${CYAN}http://${PUBLIC_IP}:${PANEL_PORT}${NC}"
-echo -e "    Password : ${CYAN}${PANEL_PASSWORD}${NC}"
+echo -e "    Password : ${DIM}(the one you entered — it has been bcrypt-hashed in config.env)${NC}"
 echo -e "    Restart  : ${YELLOW}sudo systemctl restart arma-panel${NC}"
 echo -e "    Logs     : ${YELLOW}sudo journalctl -u arma-panel -f${NC}"
 echo ""
