@@ -184,8 +184,10 @@ if [[ "$MODE" == "full" ]]; then
     echo -e "${YELLOW}[2/6] Installing system dependencies...${NC}"
     dpkg --add-architecture i386
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip curl lib32gcc-s1 binutils
-    pip3 install flask bcrypt --break-system-packages -q
+    # Install Flask and bcrypt via apt rather than pip — avoids the "Cannot
+    # uninstall blinker, RECORD file not found" error caused by pip trying
+    # to replace apt-managed dependencies on Ubuntu 24.04.
+    apt-get install -y -qq python3 curl lib32gcc-s1 binutils python3-flask python3-bcrypt
     echo -e "      ${GREEN}✓ Done.${NC}"
 
     # Step 3: SteamCMD
@@ -284,8 +286,7 @@ echo -e "${YELLOW}[${PANEL_STEP}/${TOTAL_STEPS}] Installing management panel...$
 # Dependencies (panel-only mode)
 if [[ "$MODE" == "panel" ]]; then
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip binutils
-    pip3 install flask bcrypt --break-system-packages -q
+    apt-get install -y -qq python3 binutils python3-flask python3-bcrypt
 fi
 
 mkdir -p "$PANEL_DIR/static"
