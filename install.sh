@@ -184,7 +184,7 @@ if [[ "$MODE" == "full" ]]; then
     echo -e "${YELLOW}[2/6] Installing system dependencies...${NC}"
     dpkg --add-architecture i386
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip curl lib32gcc-s1 iptables-persistent binutils
+    apt-get install -y -qq python3 python3-pip curl lib32gcc-s1 binutils
     pip3 install flask bcrypt --break-system-packages -q
     echo -e "      ${GREEN}✓ Done.${NC}"
 
@@ -247,12 +247,8 @@ EOF
     chown "$ARMA_USER:$ARMA_USER" "$SERVER_CONFIG"
     echo -e "      ${GREEN}✓ config.json generated.${NC}"
 
-    # Firewall
-    echo -e "      Opening game ports (UDP ${GAME_PORT}, 17777, 27016)..."
-    iptables -I INPUT -p udp --dport "$GAME_PORT" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport 17777        -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport 27016        -j ACCEPT 2>/dev/null || true
-    netfilter-persistent save 2>/dev/null || true
+    # Firewall is intentionally NOT touched — see post-install summary.
+    # The user is expected to manage their own firewall (UFW recommended).
 
     # Arma server systemd service
     cat > /etc/systemd/system/arma-server.service << EOF
@@ -288,7 +284,7 @@ echo -e "${YELLOW}[${PANEL_STEP}/${TOTAL_STEPS}] Installing management panel...$
 # Dependencies (panel-only mode)
 if [[ "$MODE" == "panel" ]]; then
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip iptables-persistent binutils
+    apt-get install -y -qq python3 python3-pip binutils
     pip3 install flask bcrypt --break-system-packages -q
 fi
 
@@ -352,8 +348,7 @@ systemctl daemon-reload
 systemctl enable arma-panel
 systemctl restart arma-panel
 
-iptables -I INPUT -p tcp --dport "$PANEL_PORT" -j ACCEPT 2>/dev/null || true
-netfilter-persistent save 2>/dev/null || true
+# Firewall is intentionally NOT touched — see post-install summary.
 
 echo -e "      ${GREEN}✓ Panel installed and started.${NC}"
 
@@ -382,6 +377,20 @@ echo -e "    Logs     : ${YELLOW}sudo journalctl -u arma-panel -f${NC}"
 echo ""
 echo -e "  ${BOLD}Update panel in the future:${NC}"
 echo -e "    ${YELLOW}git pull && sudo bash install.sh --update${NC}"
+echo ""
+echo -e "${BOLD}${YELLOW}⚠  Firewall — action required${NC}"
+echo -e "  This installer does ${BOLD}not${NC} touch your firewall. Open the following ports"
+echo -e "  yourself so players (and you) can reach the server and panel:"
+echo ""
+if [[ "$MODE" == "full" ]]; then
+echo -e "    ${CYAN}sudo ufw allow ${GAME_PORT}/udp${NC}      ${DIM}# Reforger game port${NC}"
+echo -e "    ${CYAN}sudo ufw allow 17777/udp${NC}              ${DIM}# A2S server-browser query${NC}"
+fi
+echo -e "    ${CYAN}sudo ufw allow ${PANEL_PORT}/tcp${NC}        ${DIM}# Panel web UI${NC}"
+echo -e "    ${CYAN}sudo ufw reload${NC}"
+echo ""
+echo -e "  ${DIM}Tip: bind the panel to 127.0.0.1 and SSH-tunnel instead of opening${NC}"
+echo -e "  ${DIM}${PANEL_PORT}/tcp publicly — even with the hashed password, HTTP is sniffable.${NC}"
 echo ""
 if [[ "$MODE" == "full" ]]; then
 echo -e "  ${DIM}Tip: Connect in-game via Multiplayer → Direct Connect → ${PUBLIC_IP}:${GAME_PORT}${NC}"
