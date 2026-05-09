@@ -13,11 +13,13 @@ Local fork — modifications:
 from flask import Flask, request, jsonify, session, redirect, Response, send_from_directory
 import bcrypt
 import hmac
+import mmap
 import re
 import secrets
 import subprocess
 import os
 import json
+import threading
 import time
 import glob
 
@@ -256,22 +258,33 @@ def _mod_label_from_dir(mod_dir):
     return base
 
 
-def _strings_extract(pak_path):
-    """Run `strings` over a .pak and return a deduped list of scenario IDs found."""
+_PAK_MAX_BYTES = 8 * 1024 * 1024 * 1024  # skip pathologically huge paks
+
+
+def _scan_pak(pak_path):
+    """Memory-map the .pak and regex-scan for scenario IDs. Constant RAM regardless
+    of file size — the OS pages the file in/out as the scanner walks. No subprocess,
+    no captured stdout, so concurrent scans don't pile up gigabytes of buffered text.
+    """
     try:
-        proc = subprocess.run(
-            ["strings", "-a", "-n", "8", pak_path],
-            capture_output=True, timeout=120, check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        size = os.path.getsize(pak_path)
+        if size <= 0 or size > _PAK_MAX_BYTES:
+            return []
+        with open(pak_path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                found = {}
+                for m in _SCENARIO_RE.finditer(mm):
+                    gid = m.group(1).decode("ascii").upper()
+                    path = m.group(2).decode("ascii")
+                    sid = "{" + gid + "}" + path
+                    found.setdefault(sid, sid)
+                return list(found.keys())
+    except (OSError, ValueError):
         return []
-    found = {}
-    for m in _SCENARIO_RE.finditer(proc.stdout):
-        gid = m.group(1).decode("ascii").upper()
-        path = m.group(2).decode("ascii")
-        sid = "{" + gid + "}" + path
-        found.setdefault(sid, sid)
-    return list(found.keys())
+
+
+_SCAN_LOCK = threading.Lock()
+_LAST_SCAN_RESULT: dict = {"scenarios": [], "diag": None, "ts": 0.0}
 
 
 def _candidate_workshop_dirs():
@@ -315,11 +328,8 @@ def _find_pak_files(root, max_depth=3):
             yield dirpath, os.path.join(dirpath, "data.pak")
 
 
-def discover_mod_scenarios(force_rescan=False):
-    """Return (scenarios, diag) where:
-       scenarios: list[{id, name, source}] discovered from installed mods (cached)
-       diag: dict with debugging info (workshop_dir tried, paks found, etc.)
-    """
+def _discover_locked(force_rescan):
+    """Actual scan work. Caller must hold _SCAN_LOCK."""
     diag = {"candidates_tried": [], "workshop_dir": None, "paks_found": 0,
             "mods_with_scenarios": 0, "scenarios_total": 0, "errors": []}
 
@@ -344,11 +354,9 @@ def discover_mod_scenarios(force_rescan=False):
     fresh_mods, fresh_mtimes = {}, {}
 
     for mod_dir, pak in pak_files:
-        # Use the relative path from workshop_dir as a stable cache key.
-        try:
-            key = os.path.relpath(mod_dir, workshop_dir)
-        except ValueError:
-            key = mod_dir
+        # Cache key is the absolute pak path — stable regardless of which
+        # candidate workshop dir was picked.
+        key = os.path.abspath(pak)
         try:
             mtime = os.path.getmtime(pak)
         except OSError as e:
@@ -361,7 +369,7 @@ def discover_mod_scenarios(force_rescan=False):
             continue
 
         label = _mod_label_from_dir(mod_dir)
-        sids = _strings_extract(pak)
+        sids = _scan_pak(pak)
         if sids:
             fresh_mods[key] = [
                 {"id": sid, "name": sid.split("/")[-1].replace(".conf", ""), "source": label}
@@ -379,6 +387,44 @@ def discover_mod_scenarios(force_rescan=False):
     return flat, diag
 
 
+def discover_mod_scenarios(force_rescan=False):
+    """Return (scenarios, diag).
+       Lock-protected so concurrent /api/status polls or rescan clicks can't
+       launch overlapping scans.  Non-rescan callers get the cached result
+       without doing any disk I/O if a scan is already in progress."""
+    if not force_rescan:
+        # Cheap path: just read the on-disk cache.
+        cache_mods, _mtimes = _scan_cache_load()
+        if cache_mods:
+            flat = []
+            for sids in cache_mods.values():
+                flat.extend(sids)
+            diag = {"workshop_dir": None, "paks_found": len(cache_mods),
+                    "scenarios_total": len(flat), "from_cache": True}
+            return flat, diag
+
+    if not _SCAN_LOCK.acquire(blocking=force_rescan):
+        # Scan in progress and we don't want to block — return whatever we have.
+        return _LAST_SCAN_RESULT["scenarios"], (_LAST_SCAN_RESULT["diag"] or {"busy": True})
+    try:
+        scenarios, diag = _discover_locked(force_rescan)
+        _LAST_SCAN_RESULT["scenarios"] = scenarios
+        _LAST_SCAN_RESULT["diag"] = diag
+        _LAST_SCAN_RESULT["ts"] = time.time()
+        return scenarios, diag
+    finally:
+        _SCAN_LOCK.release()
+
+
+def cached_scenarios():
+    """Cheap read for /api/status — never triggers a fresh scan."""
+    cache_mods, _mtimes = _scan_cache_load()
+    flat = []
+    for sids in cache_mods.values():
+        flat.extend(sids)
+    return flat
+
+
 def all_scenarios(force_rescan=False):
     """Vanilla list + auto-discovered, deduped by id (vanilla wins for naming).
        Returns (list, diag)."""
@@ -391,6 +437,18 @@ def all_scenarios(force_rescan=False):
     out = list(by_id.values())
     out.sort(key=lambda s: (s["source"] != "vanilla", s["source"], s["name"]))
     return out, diag
+
+
+def all_scenarios_cached():
+    """Like all_scenarios() but never scans — used by /api/status hot path."""
+    by_id = {}
+    for s in AVAILABLE_MISSIONS:
+        by_id[s["id"]] = dict(s)
+    for s in cached_scenarios():
+        by_id.setdefault(s["id"], dict(s))
+    out = list(by_id.values())
+    out.sort(key=lambda s: (s["source"] != "vanilla", s["source"], s["name"]))
+    return out
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -534,7 +592,7 @@ def api_status():
     cfg = read_config()
     cpu, ram = get_cpu_ram(pid) if pid else (0.0, 0.0)
     ram_used, ram_total = get_system_ram()
-    missions, _diag = all_scenarios()
+    missions = all_scenarios_cached()
     return jsonify({
         "running":        pid is not None,
         "pid":            pid,
@@ -637,7 +695,7 @@ def api_config():
         cfg.setdefault("game", {})["name"] = data["server_name"].strip(); changed = True
     if "scenario_id" in data:
         sid = data["scenario_id"].strip()
-        valid_ids = {m["id"] for m in all_scenarios()[0]}
+        valid_ids = {m["id"] for m in all_scenarios_cached()}
         if sid not in valid_ids:
             return jsonify({"ok": False, "error": "Unknown scenario"})
         cfg.setdefault("game", {})["scenarioId"] = sid; changed = True
