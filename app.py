@@ -154,6 +154,11 @@ def _security_headers(resp):
     return resp
 
 # ─── MISSIONS ─────────────────────────────────────────────────────────────────
+#
+# Hardcoded Bohemia/vanilla scenarios used as a fallback when the dedicated
+# server install can't be scanned (e.g. SERVER_DIR misconfigured). When the
+# server install IS scannable, dynamic discovery from its addons folder
+# supersedes this list.
 
 AVAILABLE_MISSIONS = [
     # Everon
@@ -192,22 +197,30 @@ AVAILABLE_MISSIONS = [
     {"id": "{D1647575BCEA5A05}Missions/Scenario03_Villa.conf",         "name": "Operation Omega 03: Light In The Dark"},
     {"id": "{6D224A109B973DD8}Missions/Scenario04_Sabotage.conf",      "name": "Operation Omega 04: Red Silence"},
     {"id": "{FA2AB0181129CB16}Missions/Scenario05_Hill.conf",          "name": "Operation Omega 05: Cliffhanger"},
-    # RHS — Status Quo (requires mod)
-    {"id": "{AAD43C10045857C1}Missions/RHS_Conflict.conf",              "name": "RHS — Conflict Everon"},
-    {"id": "{B694A77592CB69E0}Missions/RHS_ConflictWithoutAIs.conf",    "name": "RHS — Conflict Everon (No AI)"},
-    {"id": "{9909DB7ECEA05535}Missions/RHS_Conflict_East.conf",         "name": "RHS — Conflict Everon East"},
-    {"id": "{2F5DD5ACC14120A9}Missions/RHS_Conflict_NorthCentral.conf", "name": "RHS — Conflict Everon North Central"},
-    {"id": "{57B154A20B8B283E}Missions/RHS_Conflict_SWCoast.conf",      "name": "RHS — Conflict Everon SW Coast"},
-    {"id": "{367A7800D147878A}Missions/RHS_Conflict_West.conf",         "name": "RHS — Conflict Everon West"},
-    {"id": "{7577640CD42A00BD}Missions/RHS_Conflict_Arland.conf",       "name": "RHS — Conflict Arland"},
-    {"id": "{C5EAD55037EB4751}Missions/RHS_CombatOps_MSV.conf",        "name": "RHS — Combat Ops Arland (MSV vs FIA)"},
-    {"id": "{D10B11A71A36FCF5}Missions/RHS_CombatOps_USMC_vs_MSV.conf","name": "RHS — Combat Ops Arland (USMC vs MSV)"},
-    {"id": "{68A6FBF43B801FF6}Missions/RHS_ShowcaseBasic.conf",         "name": "RHS — Showcase Mission"},
-    {"id": "{217436B52D34E4BD}Missions/RHS_Showcase_GM.conf",           "name": "RHS — Showcase Mission (Game Master)"},
 ]
 # Add a "source" tag so the UI can group by origin.
 for _m in AVAILABLE_MISSIONS:
     _m.setdefault("source", "vanilla")
+
+
+# Friendly display names for scenarios discovered via .rdb (which only gives
+# us the filename, not the publisher's display name). Used as an override when
+# the .rdb scan finds a known scenario ID. Anything not listed here falls back
+# to the cleaned-up filename derived from the path.
+_SCENARIO_NAME_OVERRIDES = {
+    # RHS — Status Quo
+    "{AAD43C10045857C1}Missions/RHS_Conflict.conf":              ("Conflict — Everon (RHS)",                 64),
+    "{B694A77592CB69E0}Missions/RHS_ConflictWithoutAIs.conf":    ("Conflict — Everon, no AI (RHS)",          64),
+    "{9909DB7ECEA05535}Missions/RHS_Conflict_East.conf":         ("Conflict — Everon East (RHS)",            40),
+    "{2F5DD5ACC14120A9}Missions/RHS_Conflict_NorthCentral.conf": ("Conflict — Everon North Central (RHS)",   64),
+    "{57B154A20B8B283E}Missions/RHS_Conflict_SWCoast.conf":      ("Conflict — Everon SW Coast (RHS)",        64),
+    "{367A7800D147878A}Missions/RHS_Conflict_West.conf":         ("Conflict — Everon West (RHS)",            40),
+    "{7577640CD42A00BD}Missions/RHS_Conflict_Arland.conf":       ("Conflict — Arland (RHS)",                 64),
+    "{C5EAD55037EB4751}Missions/RHS_CombatOps_MSV.conf":         ("Combat Ops — Arland, MSV vs FIA (RHS)",   16),
+    "{D10B11A71A36FCF5}Missions/RHS_CombatOps_USMC_vs_MSV.conf": ("Combat Ops — Arland, USMC vs MSV (RHS)",  16),
+    "{68A6FBF43B801FF6}Missions/RHS_ShowcaseBasic.conf":         ("Showcase Mission (RHS)",                   6),
+    "{217436B52D34E4BD}Missions/RHS_Showcase_GM.conf":           ("Showcase Mission, Game Master (RHS)",     36),
+}
 
 
 # ─── SCENARIO AUTO-DISCOVERY (workshop meta) ─────────────────────────────────
@@ -247,35 +260,43 @@ _SCAN_LOCK = threading.Lock()
 _LAST_SCAN_RESULT: dict = {"scenarios": [], "diag": None, "ts": 0.0}
 
 
-def _candidate_workshop_dirs():
-    """Common Reforger Linux server addon paths, in priority order."""
-    candidates = []
-    if WORKSHOP_DIR:
-        candidates.append(WORKSHOP_DIR)
+def _candidate_addon_roots():
+    """Locations to scan for addons. Each entry is (path, is_vanilla).
+    `is_vanilla=True` means anything found there is Bohemia-shipped game
+    content (the dedicated server's bundled addons), not a workshop mod."""
     home = os.path.dirname(SERVER_DIR.rstrip("/")) if SERVER_DIR else os.path.expanduser("~")
     if not home or home == "/":
         home = os.path.expanduser("~arma") if os.path.isdir("/home/arma") else os.path.expanduser("~")
-    candidates.extend([
-        os.path.join(home, ".local/share/Arma Reforger/profile/addons"),
-        os.path.join(home, ".local/share/Arma Reforger/addons"),
-        os.path.join(home, ".config/Arma Reforger/addons"),
-        os.path.join(home, ".config/ArmaReforger/addons"),
+
+    roots = []
+    # Workshop mod dirs (downloaded via SteamCMD / the game)
+    if WORKSHOP_DIR:
+        roots.append((WORKSHOP_DIR, False))
+    roots.extend([
+        (os.path.join(home, ".local/share/Arma Reforger/profile/addons"), False),
+        (os.path.join(home, ".local/share/Arma Reforger/addons"),         False),
+        (os.path.join(home, ".config/Arma Reforger/addons"),              False),
+        (os.path.join(home, ".config/ArmaReforger/addons"),               False),
     ])
+    # Bohemia-shipped game content (Conflict, GM, CAH, Operation Omega, etc.)
     if SERVER_DIR:
-        candidates.extend([
-            os.path.join(SERVER_DIR, "profile/addons"),
-            os.path.join(SERVER_DIR, "addons"),
+        roots.extend([
+            (os.path.join(SERVER_DIR, "Addons"), True),
+            (os.path.join(SERVER_DIR, "addons"), True),
+            (SERVER_DIR,                          True),  # falls back to walking server install
         ])
     seen, out = set(), []
-    for d in candidates:
-        if d and d not in seen:
-            seen.add(d)
-            out.append(d)
+    for path, vanilla in roots:
+        if path and path not in seen and os.path.isdir(path):
+            seen.add(path)
+            out.append((path, vanilla))
     return out
 
 
-def _find_meta_files(root, max_depth=3):
-    """Walk `root` up to `max_depth` levels and yield (mod_dir, meta_path) for each addon."""
+def _find_addons(root, max_depth=4):
+    """Walk `root` up to `max_depth` levels and yield (addon_dir, meta_or_None,
+    rdb_or_None) for every directory that looks like a Reforger addon (i.e.
+    contains a `meta` JSON, a `resourceDatabase.rdb`, or an `addon.gproj`)."""
     if not root or not os.path.isdir(root):
         return
     root = os.path.abspath(root)
@@ -284,8 +305,28 @@ def _find_meta_files(root, max_depth=3):
         depth = dirpath.rstrip("/").count("/") - base_depth
         if depth >= max_depth:
             dirnames[:] = []
-        if "meta" in filenames:
-            yield dirpath, os.path.join(dirpath, "meta")
+        meta_file = os.path.join(dirpath, "meta") if "meta" in filenames else None
+        rdb_file = os.path.join(dirpath, "resourceDatabase.rdb") if "resourceDatabase.rdb" in filenames else None
+        gproj = "addon.gproj" in filenames
+        if meta_file or rdb_file or gproj:
+            # Don't descend into addon dirs further (their inner files aren't more addons)
+            dirnames[:] = []
+            if meta_file or rdb_file:
+                yield dirpath, meta_file, rdb_file
+
+
+def _addon_name_from_gproj(addon_dir):
+    """Pull a friendly display name from addon.gproj (TITLE or ID field)."""
+    gproj = os.path.join(addon_dir, "addon.gproj")
+    if not os.path.isfile(gproj):
+        return None
+    try:
+        with open(gproj, encoding="utf-8", errors="replace") as f:
+            text = f.read(2048)
+    except OSError:
+        return None
+    m = re.search(r'TITLE\s+"([^"]+)"', text) or re.search(r'ID\s+"([^"]+)"', text)
+    return m.group(1).strip() if m else None
 
 
 _RDB_PATH_RE = re.compile(rb'Missions/[A-Za-z0-9_./\-]+\.conf')
@@ -389,64 +430,88 @@ def _scenarios_from_meta(meta_path):
     return out, mod_name
 
 
+def _apply_name_override(scenario):
+    """If we have a curated friendly name for this scenario ID, use it."""
+    override = _SCENARIO_NAME_OVERRIDES.get(scenario["id"])
+    if override:
+        scenario["name"] = override[0]
+        if override[1] and not scenario.get("player_count"):
+            scenario["player_count"] = override[1]
+    return scenario
+
+
 def _discover_locked(force_rescan):
     """Actual scan work. Caller must hold _SCAN_LOCK."""
-    diag = {"candidates_tried": [], "workshop_dir": None, "metas_found": 0,
+    diag = {"candidates_tried": [], "addons_scanned": 0,
             "mods_with_scenarios": 0, "scenarios_total": 0, "errors": []}
-
-    workshop_dir = None
-    meta_files = []
-    for cand in _candidate_workshop_dirs():
-        diag["candidates_tried"].append({"path": cand, "exists": os.path.isdir(cand)})
-        if not os.path.isdir(cand):
-            continue
-        metas = list(_find_meta_files(cand, max_depth=3))
-        if metas:
-            workshop_dir = cand
-            meta_files = metas
-            break
-    diag["workshop_dir"] = workshop_dir
-    diag["metas_found"] = len(meta_files)
-
-    if not meta_files:
-        return [], diag
 
     cache_mods, cache_mtimes = ({}, {}) if force_rescan else _scan_cache_load()
     fresh_mods, fresh_mtimes = {}, {}
 
-    for mod_dir, meta in meta_files:
-        # Cache key is the absolute meta path — stable across candidate dirs.
-        key = os.path.abspath(meta)
-        try:
-            mtime = os.path.getmtime(meta)
-        except OSError as e:
-            diag["errors"].append(f"{key}: stat failed ({e})")
-            continue
+    seen_addon_dirs = set()
+    addons_scanned = 0
 
-        if cache_mtimes.get(key) == mtime and key in cache_mods:
-            fresh_mods[key] = cache_mods[key]
-            fresh_mtimes[key] = mtime
-            continue
+    for root, is_vanilla in _candidate_addon_roots():
+        diag["candidates_tried"].append({"path": root, "vanilla": is_vanilla})
+        for addon_dir, meta_path, rdb_path in _find_addons(root):
+            real_dir = os.path.realpath(addon_dir)
+            if real_dir in seen_addon_dirs:
+                continue
+            seen_addon_dirs.add(real_dir)
+            addons_scanned += 1
 
-        scenarios, mod_name = _scenarios_from_meta(meta)
-        if not scenarios:
-            # Linux dedicated server's meta is stripped (`scenarios:[]`). Try
-            # the addon's resourceDatabase.rdb, which always lists asset paths
-            # + GUIDs regardless of platform.
-            rdb = os.path.join(mod_dir, "resourceDatabase.rdb")
-            if os.path.isfile(rdb):
-                scenarios = _scenarios_from_rdb(rdb, mod_name)
-        if scenarios:
-            fresh_mods[key] = scenarios
-        fresh_mtimes[key] = mtime
+            # Cache key tracks both files so we re-scan if either changes.
+            cache_key = real_dir
+            try:
+                meta_mtime = os.path.getmtime(meta_path) if meta_path else 0
+                rdb_mtime  = os.path.getmtime(rdb_path) if rdb_path else 0
+                mtime = max(meta_mtime, rdb_mtime)
+            except OSError as e:
+                diag["errors"].append(f"{cache_key}: stat failed ({e})")
+                continue
+
+            if cache_mtimes.get(cache_key) == mtime and cache_key in cache_mods:
+                fresh_mods[cache_key] = cache_mods[cache_key]
+                fresh_mtimes[cache_key] = mtime
+                continue
+
+            scenarios = []
+            mod_name = None
+            # 1. Try the workshop meta JSON first (gives us the publisher's
+            #    display names + player counts when populated).
+            if meta_path:
+                scenarios, mod_name = _scenarios_from_meta(meta_path)
+            # 2. Fall back to the .rdb scan when the meta has no scenarios
+            #    (Linux dedi strips them) or when there's no meta at all
+            #    (Bohemia's bundled vanilla addons).
+            if not scenarios and rdb_path:
+                if not mod_name:
+                    mod_name = _addon_name_from_gproj(addon_dir) or os.path.basename(addon_dir)
+                source = "vanilla" if is_vanilla else mod_name
+                scenarios = _scenarios_from_rdb(rdb_path, source)
+            # 3. Force-tag everything found in the server install dir as vanilla.
+            if is_vanilla:
+                for s in scenarios:
+                    s["source"] = "vanilla"
+            # 4. Apply our curated friendly-name overrides (mainly RHS).
+            for s in scenarios:
+                _apply_name_override(s)
+
+            if scenarios:
+                fresh_mods[cache_key] = scenarios
+            fresh_mtimes[cache_key] = mtime
 
     _scan_cache_save(fresh_mods, fresh_mtimes)
 
     flat = []
     for sids in fresh_mods.values():
         flat.extend(sids)
+    diag["addons_scanned"] = addons_scanned
     diag["mods_with_scenarios"] = len(fresh_mods)
     diag["scenarios_total"] = len(flat)
+    # Back-compat fields the old UI knew about
+    diag["workshop_dir"] = "; ".join(p for p, _ in _candidate_addon_roots()) or None
+    diag["metas_found"]  = addons_scanned
     return flat, diag
 
 
