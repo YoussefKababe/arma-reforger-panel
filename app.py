@@ -493,7 +493,16 @@ def _discover_locked(force_rescan):
             if is_vanilla:
                 for s in scenarios:
                     s["source"] = "vanilla"
-            # 4. Apply our curated friendly-name overrides (mainly RHS).
+            # 4. Single-scenario mods are usually named after their scenario.
+            #    The .rdb fallback only knows the filename (e.g.
+            #    "MontfordFortress"), but the workshop name is the friendly
+            #    one ("Fortress"). When a mod publishes exactly one scenario
+            #    and we have an addon display name, prefer that — unless an
+            #    explicit override is already in place.
+            if len(scenarios) == 1 and not is_vanilla and mod_name:
+                if scenarios[0]["id"] not in _SCENARIO_NAME_OVERRIDES:
+                    scenarios[0]["name"] = mod_name
+            # 5. Apply our curated friendly-name overrides (mainly RHS).
             for s in scenarios:
                 _apply_name_override(s)
 
