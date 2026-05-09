@@ -307,6 +307,28 @@
   .field-input:focus { border-color: var(--accent); }
   .field-input option { background: var(--surface); color: var(--text); }
 
+  /* Mission field: the rescan button + count badge sit absolutely in the
+     field-group's top-right corner so they don't push the grid row taller
+     than the matching label on the left. */
+  .field-group--mission { position: relative; }
+  .field-group--mission .field-aux {
+    position: absolute; top: 0; right: 0;
+    display: flex; align-items: center; gap: 12px;
+    line-height: 1;
+  }
+  .field-group--mission .field-aux #scenario-source-badge {
+    font-size: 10px; letter-spacing: 0.05em; color: var(--muted);
+    font-family: 'Barlow', sans-serif; text-transform: none;
+  }
+  .link-btn {
+    background: transparent; border: none; padding: 0; cursor: pointer;
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
+    font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--muted); transition: color 0.15s;
+  }
+  .link-btn:hover     { color: var(--accent); }
+  .link-btn:disabled  { color: var(--border); cursor: not-allowed; }
+
   .btn-save {
     margin-top: 14px;
     background: var(--accent); border: none; color: #0a0c0f;
@@ -504,15 +526,12 @@
         <label for="input-name">Name serwera</label>
         <input type="text" id="input-name" placeholder="np. LEM Arma" maxlength="64" />
       </div>
-      <div class="field-group">
-        <label for="input-mission" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <span>Scenario / Mission</span>
-          <span id="scenario-source-badge" style="font-size:10px;letter-spacing:0.1em;color:var(--muted);font-weight:400;text-transform:none;"></span>
-          <button type="button" id="btn-rescan-scenarios" onclick="rescanScenarios()"
-            style="margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--muted);font-size:10px;letter-spacing:0.15em;text-transform:uppercase;padding:4px 10px;cursor:pointer;font-family:inherit;">
-            Rescan from mods
-          </button>
-        </label>
+      <div class="field-group field-group--mission">
+        <label for="input-mission">Scenario / Mission</label>
+        <div class="field-aux">
+          <span id="scenario-source-badge"></span>
+          <button type="button" id="btn-rescan-scenarios" class="link-btn" onclick="rescanScenarios()">Rescan from mods</button>
+        </div>
         <select id="input-mission"></select>
       </div>
       <div class="field-group">
