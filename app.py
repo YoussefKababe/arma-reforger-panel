@@ -288,6 +288,64 @@ def _find_meta_files(root, max_depth=3):
             yield dirpath, os.path.join(dirpath, "meta")
 
 
+_RDB_PATH_RE = re.compile(rb'Missions/[A-Za-z0-9_./\-]+\.conf')
+
+def _scenarios_from_rdb(rdb_path, source_label):
+    """Fallback: parse `resourceDatabase.rdb` for scenario records.
+
+    The dedicated-server workshop downloader strips `meta.versions[].scenarios`
+    on Linux (just an empty list), so we can't rely on the JSON for those.
+    The .rdb file ships next to data.pak in every addon and contains the
+    asset directory in a simple length-prefixed binary format. Each scenario
+    asset record looks like:
+        <4-byte LE length>  <path bytes>  <\\0>  <6-byte padding>  <8-byte LE GUID>  …
+    where the LE length equals len(path) + 1 (counting the null terminator).
+    The 8-byte GUID is little-endian, so we reverse it for the {HEX16} display.
+
+    We rely on the path-prefix `Missions/` to filter for scenarios, then
+    validate each candidate by checking the length prefix matches; this
+    rejects stray substring hits in unrelated records.
+    """
+    try:
+        with open(rdb_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+
+    out = []
+    seen = set()
+    for m in _RDB_PATH_RE.finditer(data):
+        ps, pe = m.start(), m.end()
+        if ps < 4:
+            continue
+        path_len_field = int.from_bytes(data[ps - 4:ps], "little")
+        if path_len_field != (pe - ps) + 1:
+            continue  # not a length-prefixed record — likely a substring inside something else
+        if pe >= len(data) or data[pe] != 0:
+            continue
+        guid_start = pe + 7  # 1 null byte + 6-byte padding
+        if guid_start + 8 > len(data):
+            continue
+        guid_bytes = data[guid_start:guid_start + 8]
+        # Reject obviously-bogus GUIDs (all-zero / all-0xFF fillers).
+        if guid_bytes == b"\x00" * 8 or guid_bytes == b"\xff" * 8:
+            continue
+        guid_hex = guid_bytes[::-1].hex().upper()  # little-endian → big-endian display
+        path_str = m.group(0).decode("ascii", errors="replace")
+        sid = "{" + guid_hex + "}" + path_str
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append({
+            "id": sid,
+            "name": path_str.split("/")[-1].replace(".conf", ""),
+            "description": "",
+            "player_count": None,
+            "source": source_label or "mod",
+        })
+    return out
+
+
 def _scenarios_from_meta(meta_path):
     """Parse a workshop `meta` file and return a list of scenario dicts:
        [{id, name, description, player_count, source}, ...]
@@ -370,7 +428,14 @@ def _discover_locked(force_rescan):
             fresh_mtimes[key] = mtime
             continue
 
-        scenarios, _mod_name = _scenarios_from_meta(meta)
+        scenarios, mod_name = _scenarios_from_meta(meta)
+        if not scenarios:
+            # Linux dedicated server's meta is stripped (`scenarios:[]`). Try
+            # the addon's resourceDatabase.rdb, which always lists asset paths
+            # + GUIDs regardless of platform.
+            rdb = os.path.join(mod_dir, "resourceDatabase.rdb")
+            if os.path.isfile(rdb):
+                scenarios = _scenarios_from_rdb(rdb, mod_name)
         if scenarios:
             fresh_mods[key] = scenarios
         fresh_mtimes[key] = mtime
