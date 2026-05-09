@@ -205,9 +205,11 @@ if [[ "$MODE" == "full" ]]; then
     echo -e "      ${DIM}This may take 10–30 minutes depending on your connection.${NC}"
     mkdir -p "$SERVER_DIR"
     chown -R "$ARMA_USER:$ARMA_USER" "$SERVER_DIR"
+    # NOTE: +force_install_dir MUST come before +login, otherwise SteamCMD
+    # fails with "Please use force_install_dir before logon!"
     sudo -u "$ARMA_USER" "$STEAM_DIR/steamcmd.sh" \
-        +login anonymous \
         +force_install_dir "$SERVER_DIR" \
+        +login anonymous \
         +app_update "$ARMA_APP_ID" validate \
         +quit
     echo -e "      ${GREEN}✓ Arma Reforger Server downloaded.${NC}"
