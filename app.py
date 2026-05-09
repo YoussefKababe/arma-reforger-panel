@@ -13,7 +13,6 @@ Local fork — modifications:
 from flask import Flask, request, jsonify, session, redirect, Response, send_from_directory
 import bcrypt
 import hmac
-import mmap
 import re
 import secrets
 import subprocess
@@ -211,14 +210,19 @@ for _m in AVAILABLE_MISSIONS:
     _m.setdefault("source", "vanilla")
 
 
-# ─── SCENARIO AUTO-DISCOVERY (mod .pak scan) ──────────────────────────────────
+# ─── SCENARIO AUTO-DISCOVERY (workshop meta) ─────────────────────────────────
 #
-# Reforger workshop mods unpack to <WORKSHOP_DIR>/<Name>_<HEXID>/data.pak.
-# `data.pak` is a binary IFF file but `strings` reliably finds scenario IDs
-# embedded as `{HEX16}Missions/Path/Name.conf`. We cache results per .pak by
-# mtime to avoid rescanning every page load.
+# Reforger workshop mods unpack to <WORKSHOP_DIR>/<Name>_<HEXID>/. Each addon
+# ships a `meta` file (UTF-8-with-BOM JSON) that contains the workshop
+# metadata, including a `versions[].scenarios[]` array. Each scenario entry
+# is a dict with at least `name` and `gameId` (the full {HEX16}Missions/...
+# .conf identifier we need). This is far more reliable than scanning the
+# binary .pak file — and the `meta` file is tiny, so the scan is instant.
+#
+# We cache results per addon dir by `meta` mtime to avoid re-reading the same
+# file if nothing changed.
 
-_SCENARIO_RE = re.compile(rb'\{([0-9A-Fa-f]{16})\}(Missions/[A-Za-z0-9_./\-]+\.conf)')
+_SCENARIO_GAME_ID_RE = re.compile(r'^\{[0-9A-Fa-f]{16}\}.+\.conf$')
 _SCAN_CACHE_FILE = os.path.join(_BASE_DIR, ".scenario-cache.json")
 
 
@@ -237,50 +241,6 @@ def _scan_cache_save(mods, mtimes):
             json.dump({"mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
     except OSError as e:
         print(f"[panel] WARNING: could not write scenario cache: {e}", flush=True)
-
-
-def _mod_label_from_dir(mod_dir):
-    """Best-effort friendly name from <mod_dir>/meta JSON, falling back to dir basename."""
-    meta = os.path.join(mod_dir, "meta")
-    if os.path.isfile(meta):
-        try:
-            with open(meta, encoding="utf-8-sig") as f:
-                data = json.load(f)
-            name = (data.get("meta") or {}).get("name")
-            if name:
-                return str(name)
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-    base = os.path.basename(mod_dir)
-    parts = base.rsplit("_", 1)
-    if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789ABCDEFabcdef" for c in parts[1]):
-        return parts[0]
-    return base
-
-
-_PAK_MAX_BYTES = 8 * 1024 * 1024 * 1024  # skip pathologically huge paks
-
-
-def _scan_pak(pak_path):
-    """Memory-map the .pak and regex-scan for scenario IDs. Constant RAM regardless
-    of file size — the OS pages the file in/out as the scanner walks. No subprocess,
-    no captured stdout, so concurrent scans don't pile up gigabytes of buffered text.
-    """
-    try:
-        size = os.path.getsize(pak_path)
-        if size <= 0 or size > _PAK_MAX_BYTES:
-            return []
-        with open(pak_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                found = {}
-                for m in _SCENARIO_RE.finditer(mm):
-                    gid = m.group(1).decode("ascii").upper()
-                    path = m.group(2).decode("ascii")
-                    sid = "{" + gid + "}" + path
-                    found.setdefault(sid, sid)
-                return list(found.keys())
-    except (OSError, ValueError):
-        return []
 
 
 _SCAN_LOCK = threading.Lock()
@@ -314,8 +274,8 @@ def _candidate_workshop_dirs():
     return out
 
 
-def _find_pak_files(root, max_depth=3):
-    """Walk `root` up to `max_depth` levels and yield (mod_dir, pak_path) for each data.pak."""
+def _find_meta_files(root, max_depth=3):
+    """Walk `root` up to `max_depth` levels and yield (mod_dir, meta_path) for each addon."""
     if not root or not os.path.isdir(root):
         return
     root = os.path.abspath(root)
@@ -324,41 +284,83 @@ def _find_pak_files(root, max_depth=3):
         depth = dirpath.rstrip("/").count("/") - base_depth
         if depth >= max_depth:
             dirnames[:] = []
-        if "data.pak" in filenames:
-            yield dirpath, os.path.join(dirpath, "data.pak")
+        if "meta" in filenames:
+            yield dirpath, os.path.join(dirpath, "meta")
+
+
+def _scenarios_from_meta(meta_path):
+    """Parse a workshop `meta` file and return a list of scenario dicts:
+       [{id, name, description, player_count, source}, ...]
+       The `meta` file is UTF-8 with BOM and contains the workshop publisher
+       metadata. Scenarios appear under meta.versions[].scenarios[].
+    """
+    try:
+        with open(meta_path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return [], None
+
+    m = (data.get("meta") or {})
+    mod_name = (m.get("name") or "").strip()
+
+    # Pull scenarios from the latest version (versions[0]) — that's what's installed.
+    versions = m.get("versions") or []
+    raw_scenarios = []
+    if versions and isinstance(versions, list):
+        raw_scenarios = versions[0].get("scenarios") or []
+    if not raw_scenarios:
+        # Some older meta layouts have a top-level scenarios array.
+        raw_scenarios = m.get("scenarios") or []
+    if not isinstance(raw_scenarios, list):
+        return [], mod_name
+
+    out = []
+    for s in raw_scenarios:
+        if not isinstance(s, dict):
+            continue
+        sid = (s.get("gameId") or "").strip()
+        if not sid or not _SCENARIO_GAME_ID_RE.match(sid):
+            continue
+        out.append({
+            "id":           sid,
+            "name":         (s.get("name") or sid.split("/")[-1].replace(".conf", "")).strip(),
+            "description":  (s.get("description") or "").strip()[:300],
+            "player_count": s.get("playerCount") if isinstance(s.get("playerCount"), int) else None,
+            "source":       mod_name or "mod",
+        })
+    return out, mod_name
 
 
 def _discover_locked(force_rescan):
     """Actual scan work. Caller must hold _SCAN_LOCK."""
-    diag = {"candidates_tried": [], "workshop_dir": None, "paks_found": 0,
+    diag = {"candidates_tried": [], "workshop_dir": None, "metas_found": 0,
             "mods_with_scenarios": 0, "scenarios_total": 0, "errors": []}
 
     workshop_dir = None
-    pak_files = []
+    meta_files = []
     for cand in _candidate_workshop_dirs():
         diag["candidates_tried"].append({"path": cand, "exists": os.path.isdir(cand)})
         if not os.path.isdir(cand):
             continue
-        paks = list(_find_pak_files(cand, max_depth=3))
-        if paks:
+        metas = list(_find_meta_files(cand, max_depth=3))
+        if metas:
             workshop_dir = cand
-            pak_files = paks
+            meta_files = metas
             break
     diag["workshop_dir"] = workshop_dir
-    diag["paks_found"] = len(pak_files)
+    diag["metas_found"] = len(meta_files)
 
-    if not pak_files:
+    if not meta_files:
         return [], diag
 
     cache_mods, cache_mtimes = ({}, {}) if force_rescan else _scan_cache_load()
     fresh_mods, fresh_mtimes = {}, {}
 
-    for mod_dir, pak in pak_files:
-        # Cache key is the absolute pak path — stable regardless of which
-        # candidate workshop dir was picked.
-        key = os.path.abspath(pak)
+    for mod_dir, meta in meta_files:
+        # Cache key is the absolute meta path — stable across candidate dirs.
+        key = os.path.abspath(meta)
         try:
-            mtime = os.path.getmtime(pak)
+            mtime = os.path.getmtime(meta)
         except OSError as e:
             diag["errors"].append(f"{key}: stat failed ({e})")
             continue
@@ -368,13 +370,9 @@ def _discover_locked(force_rescan):
             fresh_mtimes[key] = mtime
             continue
 
-        label = _mod_label_from_dir(mod_dir)
-        sids = _scan_pak(pak)
-        if sids:
-            fresh_mods[key] = [
-                {"id": sid, "name": sid.split("/")[-1].replace(".conf", ""), "source": label}
-                for sid in sids
-            ]
+        scenarios, _mod_name = _scenarios_from_meta(meta)
+        if scenarios:
+            fresh_mods[key] = scenarios
         fresh_mtimes[key] = mtime
 
     _scan_cache_save(fresh_mods, fresh_mtimes)
