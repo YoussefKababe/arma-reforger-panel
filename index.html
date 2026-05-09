@@ -296,6 +296,17 @@
   .field-group select:focus { border-color: var(--accent); }
   .field-group select option { background: var(--surface); color: var(--text); }
 
+  /* Standalone input styling — same look as .field-group inputs but
+     used outside of one (e.g. inline in flex rows). */
+  .field-input {
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); font-family: 'Barlow', sans-serif;
+    font-size: 14px; padding: 10px 14px; outline: none;
+    transition: border-color 0.2s;
+  }
+  .field-input:focus { border-color: var(--accent); }
+  .field-input option { background: var(--surface); color: var(--text); }
+
   .btn-save {
     margin-top: 14px;
     background: var(--accent); border: none; color: #0a0c0f;
@@ -533,7 +544,7 @@
   { "modId": "595F2BF2F44836FB", "name": "RHS - Status Quo", "version": "0.14.4899" }
 ]' style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:11.5px;padding:10px;line-height:1.5;resize:vertical;outline:none;"></textarea>
       <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;">
-        <select id="mods-import-mode" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;font-size:12px;">
+        <select id="mods-import-mode" class="field-input" style="min-width:180px;">
           <option value="replace">Replace full list</option>
           <option value="merge">Merge with existing</option>
         </select>
