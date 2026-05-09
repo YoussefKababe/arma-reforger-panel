@@ -274,64 +274,123 @@ def _strings_extract(pak_path):
     return list(found.keys())
 
 
+def _candidate_workshop_dirs():
+    """Common Reforger Linux server addon paths, in priority order."""
+    candidates = []
+    if WORKSHOP_DIR:
+        candidates.append(WORKSHOP_DIR)
+    home = os.path.dirname(SERVER_DIR.rstrip("/")) if SERVER_DIR else os.path.expanduser("~")
+    if not home or home == "/":
+        home = os.path.expanduser("~arma") if os.path.isdir("/home/arma") else os.path.expanduser("~")
+    candidates.extend([
+        os.path.join(home, ".local/share/Arma Reforger/profile/addons"),
+        os.path.join(home, ".local/share/Arma Reforger/addons"),
+        os.path.join(home, ".config/Arma Reforger/addons"),
+        os.path.join(home, ".config/ArmaReforger/addons"),
+    ])
+    if SERVER_DIR:
+        candidates.extend([
+            os.path.join(SERVER_DIR, "profile/addons"),
+            os.path.join(SERVER_DIR, "addons"),
+        ])
+    seen, out = set(), []
+    for d in candidates:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _find_pak_files(root, max_depth=3):
+    """Walk `root` up to `max_depth` levels and yield (mod_dir, pak_path) for each data.pak."""
+    if not root or not os.path.isdir(root):
+        return
+    root = os.path.abspath(root)
+    base_depth = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        depth = dirpath.rstrip("/").count("/") - base_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        if "data.pak" in filenames:
+            yield dirpath, os.path.join(dirpath, "data.pak")
+
+
 def discover_mod_scenarios(force_rescan=False):
-    """Return list[{id, name, source}] discovered from installed mods (cached)."""
-    if not WORKSHOP_DIR or not os.path.isdir(WORKSHOP_DIR):
-        return []
+    """Return (scenarios, diag) where:
+       scenarios: list[{id, name, source}] discovered from installed mods (cached)
+       diag: dict with debugging info (workshop_dir tried, paks found, etc.)
+    """
+    diag = {"candidates_tried": [], "workshop_dir": None, "paks_found": 0,
+            "mods_with_scenarios": 0, "scenarios_total": 0, "errors": []}
+
+    workshop_dir = None
+    pak_files = []
+    for cand in _candidate_workshop_dirs():
+        diag["candidates_tried"].append({"path": cand, "exists": os.path.isdir(cand)})
+        if not os.path.isdir(cand):
+            continue
+        paks = list(_find_pak_files(cand, max_depth=3))
+        if paks:
+            workshop_dir = cand
+            pak_files = paks
+            break
+    diag["workshop_dir"] = workshop_dir
+    diag["paks_found"] = len(pak_files)
+
+    if not pak_files:
+        return [], diag
 
     cache_mods, cache_mtimes = ({}, {}) if force_rescan else _scan_cache_load()
-    fresh_mods = {}
-    fresh_mtimes = {}
+    fresh_mods, fresh_mtimes = {}, {}
 
-    try:
-        entries = sorted(os.listdir(WORKSHOP_DIR))
-    except OSError:
-        return []
-
-    for name in entries:
-        mod_dir = os.path.join(WORKSHOP_DIR, name)
-        if not os.path.isdir(mod_dir):
-            continue
-        pak = os.path.join(mod_dir, "data.pak")
-        if not os.path.isfile(pak):
-            continue
+    for mod_dir, pak in pak_files:
+        # Use the relative path from workshop_dir as a stable cache key.
+        try:
+            key = os.path.relpath(mod_dir, workshop_dir)
+        except ValueError:
+            key = mod_dir
         try:
             mtime = os.path.getmtime(pak)
-        except OSError:
+        except OSError as e:
+            diag["errors"].append(f"{key}: stat failed ({e})")
             continue
 
-        if cache_mtimes.get(name) == mtime and name in cache_mods:
-            fresh_mods[name] = cache_mods[name]
-            fresh_mtimes[name] = mtime
+        if cache_mtimes.get(key) == mtime and key in cache_mods:
+            fresh_mods[key] = cache_mods[key]
+            fresh_mtimes[key] = mtime
             continue
 
         label = _mod_label_from_dir(mod_dir)
         sids = _strings_extract(pak)
         if sids:
-            fresh_mods[name] = [
+            fresh_mods[key] = [
                 {"id": sid, "name": sid.split("/")[-1].replace(".conf", ""), "source": label}
                 for sid in sids
             ]
-        fresh_mtimes[name] = mtime
+        fresh_mtimes[key] = mtime
 
     _scan_cache_save(fresh_mods, fresh_mtimes)
 
     flat = []
     for sids in fresh_mods.values():
         flat.extend(sids)
-    return flat
+    diag["mods_with_scenarios"] = len(fresh_mods)
+    diag["scenarios_total"] = len(flat)
+    return flat, diag
 
 
 def all_scenarios(force_rescan=False):
-    """Vanilla list + auto-discovered, deduped by id (vanilla wins for naming)."""
+    """Vanilla list + auto-discovered, deduped by id (vanilla wins for naming).
+       Returns (list, diag)."""
     by_id = {}
     for s in AVAILABLE_MISSIONS:
         by_id[s["id"]] = dict(s)
-    for s in discover_mod_scenarios(force_rescan=force_rescan):
+    discovered, diag = discover_mod_scenarios(force_rescan=force_rescan)
+    for s in discovered:
         by_id.setdefault(s["id"], dict(s))
     out = list(by_id.values())
     out.sort(key=lambda s: (s["source"] != "vanilla", s["source"], s["name"]))
-    return out
+    return out, diag
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -475,7 +534,7 @@ def api_status():
     cfg = read_config()
     cpu, ram = get_cpu_ram(pid) if pid else (0.0, 0.0)
     ram_used, ram_total = get_system_ram()
-    missions = all_scenarios()
+    missions, _diag = all_scenarios()
     return jsonify({
         "running":        pid is not None,
         "pid":            pid,
@@ -506,13 +565,13 @@ def api_scenarios_rescan():
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
-    missions = all_scenarios(force_rescan=True)
+    missions, diag = all_scenarios(force_rescan=True)
     return jsonify({
         "ok": True,
         "missions": missions,
         "missions_count": {"vanilla": sum(1 for m in missions if m.get("source") == "vanilla"),
                            "from_mods": sum(1 for m in missions if m.get("source") != "vanilla")},
-        "workshop_dir": WORKSHOP_DIR,
+        "diag": diag,
     })
 
 @app.route("/api/metrics")
@@ -578,7 +637,7 @@ def api_config():
         cfg.setdefault("game", {})["name"] = data["server_name"].strip(); changed = True
     if "scenario_id" in data:
         sid = data["scenario_id"].strip()
-        valid_ids = {m["id"] for m in all_scenarios()}
+        valid_ids = {m["id"] for m in all_scenarios()[0]}
         if sid not in valid_ids:
             return jsonify({"ok": False, "error": "Unknown scenario"})
         cfg.setdefault("game", {})["scenarioId"] = sid; changed = True

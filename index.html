@@ -910,7 +910,17 @@ async function rescanScenarios() {
     const d = await r.json();
     if (d.ok) {
       renderMissionSelect(d.missions, d.missions_count);
-      setLog(`Scanned. Vanilla: ${d.missions_count.vanilla} · From mods: ${d.missions_count.from_mods}`, 'ok');
+      const diag = d.diag || {};
+      let msg = `Vanilla: ${d.missions_count.vanilla} · From mods: ${d.missions_count.from_mods}`;
+      if (diag.workshop_dir) {
+        msg += ` (scanned ${diag.paks_found} .pak file${diag.paks_found === 1 ? '' : 's'} in ${diag.workshop_dir})`;
+      } else {
+        const tried = (diag.candidates_tried || []).map(c => c.path).slice(0, 3).join(', ');
+        msg += `. No .pak files found. Tried: ${tried}${(diag.candidates_tried || []).length > 3 ? '…' : ''}. Run the server once so it downloads workshop mods, or set WORKSHOP_DIR in config.env.`;
+      }
+      setLog(msg, diag.workshop_dir ? 'ok' : 'error');
+      // Stash full diagnostics in console for deep debugging.
+      if (diag) console.log('[rescan diagnostics]', diag);
     } else {
       setLog('Rescan failed: ' + (d.error || 'unknown'), 'error');
     }
