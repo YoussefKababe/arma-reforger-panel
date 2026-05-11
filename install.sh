@@ -264,7 +264,7 @@ After=network.target
 Type=simple
 User=${ARMA_USER}
 WorkingDirectory=${SERVER_DIR}
-ExecStart=${SERVER_DIR}/${ARMA_BINARY} -config ${SERVER_CONFIG} -maxFPS=${MAX_FPS}
+ExecStart=${SERVER_DIR}/${ARMA_BINARY} -config ${SERVER_CONFIG} -loadSessionSave -maxFPS=${MAX_FPS}
 Restart=on-failure
 RestartSec=10
 
@@ -316,6 +316,9 @@ print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt()).decode())
 
 # Default workshop dir for the addons that the Reforger server downloads.
 WORKSHOP_DIR="${ARMA_HOME}/.local/share/Arma Reforger/addons"
+# Default profile dir: where Reforger writes session saves. Linux dedicated
+# layout puts them under `{ARMA_HOME}/.config/ArmaReforger/profile/.save/`.
+PROFILE_DIR="${ARMA_HOME}/.config/ArmaReforger/profile"
 
 cat > "$PANEL_DIR/config.env" << EOF
 # bcrypt-hashed admin password. Generated at install time.
@@ -325,6 +328,7 @@ SERVER_DIR=${SERVER_DIR}
 SERVER_CONFIG=${SERVER_CONFIG}
 LOG_DIR=${LOG_DIR}
 WORKSHOP_DIR=${WORKSHOP_DIR}
+PROFILE_DIR=${PROFILE_DIR}
 MAX_FPS=${MAX_FPS}
 EOF
 chmod 600 "$PANEL_DIR/config.env"

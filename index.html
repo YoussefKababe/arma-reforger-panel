@@ -601,6 +601,44 @@
     </div>
   </div>
 
+  <!-- Persistence -->
+  <div class="card" style="animation-delay:0.2s">
+    <div class="card-label">Persistence</div>
+    <div style="font-size:11.5px;color:var(--muted);line-height:1.6;margin-bottom:14px;">
+      Server launches always pass <code>-loadSessionSave</code>, so any existing save is loaded on
+      start. This toggle controls the <code>persistence</code> block in <code>config.json</code> —
+      enable it to autosave every N minutes, disable to stop writing new saves (existing saves still
+      load on start; use <strong>Flush saves</strong> to start fresh). Session save only works in
+      scenarios that implement it (Conflict, Combat Ops); Game Master needs manual saves from Esc.
+    </div>
+    <div class="config-grid">
+      <div class="field-group">
+        <label for="input-persist-enabled">Enabled</label>
+        <select id="input-persist-enabled">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
+      <div class="field-group">
+        <label for="input-persist-interval">Auto-save interval (minutes, 0–60)</label>
+        <input type="number" id="input-persist-interval" min="0" max="60" step="1" value="10" />
+      </div>
+      <div class="field-group">
+        <label for="input-persist-hive">Hive ID (0–16383)</label>
+        <input type="number" id="input-persist-hive" min="0" max="16383" step="1" value="1" />
+      </div>
+    </div>
+    <div id="persist-stats" style="font-size:11.5px;color:var(--muted);margin-top:12px;line-height:1.6;"></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;">
+      <button class="btn-save" id="btn-persist-save" onclick="savePersistence()">Save changes</button>
+      <button class="btn-save" id="btn-persist-flush" onclick="flushPersistence()"
+              style="background:transparent;border:1px solid var(--offline);color:var(--offline);">
+        Flush saves
+      </button>
+    </div>
+    <div class="restart-notice" id="persist-restart-notice">⚠ Restart required for persistence changes to take effect</div>
+  </div>
+
   <!-- Live Logs -->
   <div class="log-viewer-card">
     <div class="log-viewer-header">
@@ -1063,8 +1101,9 @@ function setLog(msg, type = 'info') {
 
 function setBusy(state) {
   busy = state;
-  ['btn-start','btn-stop','btn-reset','btn-save'].forEach(id => {
-    document.getElementById(id).disabled = state;
+  ['btn-start','btn-stop','btn-reset','btn-save','btn-persist-save','btn-persist-flush'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = state;
   });
 }
 
@@ -1113,6 +1152,87 @@ async function saveConfig() {
   setBusy(false);
 }
 
+function _fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B','KB','MB','GB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+function _fmtAge(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60)   return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function _renderPersistStats(s) {
+  const el = document.getElementById('persist-stats');
+  if (!s.saves) { el.textContent = ''; return; }
+  const { path, exists, total, buckets } = s.saves;
+  if (!exists || !total || total.count === 0) {
+    el.innerHTML = `No saves yet under <code>${escHtml(path || '')}</code>.`;
+    return;
+  }
+  const bucketLabel = { game: 'World session', playersave: 'Player saves', settings: 'Settings' };
+  const rows = ['game', 'playersave', 'settings']
+    .filter(k => buckets && buckets[k] && buckets[k].count > 0)
+    .map(k => `${bucketLabel[k]}: ${buckets[k].count} file${buckets[k].count === 1 ? '' : 's'}, ${_fmtBytes(buckets[k].bytes)} (newest ${_fmtAge(buckets[k].newest)})`)
+    .join(' · ');
+  el.innerHTML = `<code>${escHtml(path)}</code><br>${rows || 'empty'}`;
+}
+
+async function fetchPersistence() {
+  try {
+    const r = await fetch('/api/persistence');
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('input-persist-enabled').value  = d.enabled ? 'true' : 'false';
+    document.getElementById('input-persist-interval').value = d.autoSaveInterval;
+    document.getElementById('input-persist-hive').value     = d.hiveId;
+    _renderPersistStats(d);
+  } catch (e) { /* panel is the source of truth; silent on transient errors */ }
+}
+
+async function savePersistence() {
+  const enabled  = document.getElementById('input-persist-enabled').value === 'true';
+  const interval = parseInt(document.getElementById('input-persist-interval').value, 10);
+  const hive     = parseInt(document.getElementById('input-persist-hive').value, 10);
+  setBusy(true);
+  setLog('Saving persistence settings...', 'info');
+  try {
+    const r = await postJson('/api/persistence', { enabled, autoSaveInterval: interval, hiveId: hive });
+    const d = await r.json();
+    if (d.ok) {
+      setLog(enabled ? 'Persistence enabled' : 'Persistence disabled', 'ok');
+      document.getElementById('persist-restart-notice').classList.toggle('visible', !!d.restart_required);
+      await fetchPersistence();
+    } else {
+      setLog('Save failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { setLog('Connection error', 'error'); }
+  setBusy(false);
+}
+
+async function flushPersistence() {
+  if (!confirm('Delete the world-session save (.save/game) and per-player saves (.save/playersave)? Server settings are kept. The next launch starts a fresh world. This cannot be undone.')) return;
+  setBusy(true);
+  setLog('Flushing saves...', 'info');
+  try {
+    const r = await postJson('/api/persistence/flush', {});
+    const d = await r.json();
+    if (d.ok) {
+      setLog(`Removed ${d.removed} save file${d.removed === 1 ? '' : 's'}`, 'ok');
+      _renderPersistStats(d);
+    } else {
+      setLog('Flush failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { setLog('Connection error', 'error'); }
+  setBusy(false);
+}
+
 async function doLogout() {
   await fetch('/logout', { method: 'POST' });
   window.location.href = '/login';
@@ -1129,7 +1249,7 @@ function startCountdown() {
   }, 1000);
 }
 
-fetchStatus().then(startCountdown);
+fetchStatus().then(() => { fetchPersistence(); startCountdown(); });
 
 // PWA — rejestracja service workera
 if ('serviceWorker' in navigator) {

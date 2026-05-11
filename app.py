@@ -58,10 +58,26 @@ SERVER_DIR     = _cfg.get("SERVER_DIR",    "/home/arma/server")
 SERVER_CONFIG  = _cfg.get("SERVER_CONFIG", "/home/arma/server/config.json")
 LOG_DIR        = _cfg.get("LOG_DIR",       "/home/arma/.config/ArmaReforger/logs")
 WORKSHOP_DIR   = _cfg.get("WORKSHOP_DIR",  os.path.expanduser("~/.local/share/Arma Reforger/addons"))
-SERVER_BINARY  = "./ArmaReforgerServer"
-SERVER_ARGS    = ["-config", SERVER_CONFIG] + (
-    [f"-maxFPS={_cfg['MAX_FPS']}"] if _cfg.get("MAX_FPS") else []
+# Where Reforger writes session saves. The real layout produced by the server
+# under install.sh defaults is `{LOG_DIR_parent}/profile/.save/`, e.g.
+# `/home/arma/.config/ArmaReforger/profile/.save/{game,playersave,settings}/`.
+# Override with PROFILE_DIR in config.env if your install differs.
+PROFILE_DIR    = _cfg.get(
+    "PROFILE_DIR",
+    os.path.join(os.path.dirname(LOG_DIR.rstrip("/")) or "/home/arma/.config/ArmaReforger", "profile"),
 )
+SERVER_BINARY  = "./ArmaReforgerServer"
+MAX_FPS        = _cfg.get("MAX_FPS", "").strip()
+
+def build_server_args():
+    """Build the launch arguments. `-loadSessionSave` is always passed: with no
+    save files it's a no-op, and including it keeps panel-launched and
+    systemd-launched starts behaving the same way. The 'enabled' toggle in the
+    UI controls only the `persistence` block in config.json (autosave)."""
+    args = ["-config", SERVER_CONFIG, "-loadSessionSave"]
+    if MAX_FPS:
+        args.append(f"-maxFPS={MAX_FPS}")
+    return args
 
 # Persistent secret key so sessions survive panel restarts.
 _SECRET_FILE = os.path.join(_BASE_DIR, ".panel-secret")
@@ -659,6 +675,99 @@ def write_config(cfg):
     with open(SERVER_CONFIG, "w") as f:
         json.dump(cfg, f, indent="\t")
 
+# ─── PERSISTENCE ─────────────────────────────────────────────────────────────
+#
+# Reforger session save/load. The toggle is the presence of a top-level
+# `persistence` block in config.json (autosave); `-loadSessionSave` is always
+# passed at launch so any existing save loads on start. Save files live under
+# PROFILE_DIR/.save/ on Linux dedicated installs (Conflict / Combat Ops layout).
+# Subdirs underneath: game/ (world/session), playersave/ (per-player), settings/.
+
+_SAVE_SUBDIRS = (".save", "save", "saves")
+
+def _persistence_enabled(cfg=None):
+    if cfg is None:
+        cfg = read_config()
+    return isinstance(cfg.get("persistence"), dict)
+
+# Subdirs the flush button targets. `settings/` is intentionally preserved
+# because it holds non-session config the server expects to regenerate from.
+_FLUSHABLE_SUBDIRS = ("game", "playersave")
+
+def _save_root():
+    for sub in _SAVE_SUBDIRS:
+        p = os.path.join(PROFILE_DIR, sub)
+        if os.path.isdir(p):
+            return p
+    return os.path.join(PROFILE_DIR, ".save")  # canonical Linux dedicated path
+
+def _scan_dir(path):
+    """Return {count, bytes, newest} for files under `path`, or zeros if absent."""
+    if not os.path.isdir(path):
+        return {"count": 0, "bytes": 0, "newest": None}
+    count = 0
+    total = 0
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            count += 1
+            total += st.st_size
+            if st.st_mtime > newest:
+                newest = st.st_mtime
+    return {"count": count, "bytes": total, "newest": newest or None}
+
+def _scan_saves():
+    root = _save_root()
+    if not os.path.isdir(root):
+        return {"path": root, "exists": False, "total": {"count": 0, "bytes": 0, "newest": None}, "buckets": {}}
+    buckets = {name: _scan_dir(os.path.join(root, name)) for name in ("game", "playersave", "settings")}
+    total_count = sum(b["count"] for b in buckets.values())
+    total_bytes = sum(b["bytes"] for b in buckets.values())
+    newest_vals = [b["newest"] for b in buckets.values() if b["newest"]]
+    return {
+        "path":    root,
+        "exists":  True,
+        "buckets": buckets,
+        "total":   {
+            "count":  total_count,
+            "bytes":  total_bytes,
+            "newest": max(newest_vals) if newest_vals else None,
+        },
+    }
+
+def _flush_saves():
+    """Remove the contents of `.save/game/` and `.save/playersave/` (world
+    session + per-player data). `.save/settings/` is left alone — it holds
+    non-session config the server regenerates from. Returns the count of files
+    deleted."""
+    import shutil
+    root = _save_root()
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    for sub in _FLUSHABLE_SUBDIRS:
+        bucket = os.path.join(root, sub)
+        if not os.path.isdir(bucket):
+            continue
+        for name in os.listdir(bucket):
+            full = os.path.join(bucket, name)
+            try:
+                if os.path.isdir(full) and not os.path.islink(full):
+                    for _dp, _dn, files in os.walk(full):
+                        removed += len(files)
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def get_map_name(cfg=None):
     try:
         if cfg is None:
@@ -850,6 +959,81 @@ def api_config():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
+@app.route("/api/persistence", methods=["GET"])
+def api_persistence_get():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    cfg = read_config()
+    block = cfg.get("persistence") if isinstance(cfg.get("persistence"), dict) else {}
+    saves = _scan_saves()
+    return jsonify({
+        "enabled":         _persistence_enabled(cfg),
+        "autoSaveInterval": block.get("autoSaveInterval", 10),
+        "hiveId":           block.get("hiveId", 1),
+        "saves":            saves,
+        "profile_dir":      PROFILE_DIR,
+    })
+
+@app.route("/api/persistence", methods=["POST"])
+def api_persistence_set():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    cfg  = read_config()
+    enabled = bool(data.get("enabled"))
+    if enabled:
+        block = cfg.get("persistence") if isinstance(cfg.get("persistence"), dict) else {}
+        if "autoSaveInterval" in data:
+            try:
+                v = int(data["autoSaveInterval"])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "autoSaveInterval must be an integer"})
+            if not 0 <= v <= 60:
+                return jsonify({"ok": False, "error": "autoSaveInterval must be between 0 and 60"})
+            block["autoSaveInterval"] = v
+        else:
+            block.setdefault("autoSaveInterval", 10)
+        if "hiveId" in data:
+            try:
+                v = int(data["hiveId"])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "hiveId must be an integer"})
+            if not 0 <= v <= 16383:
+                return jsonify({"ok": False, "error": "hiveId must be between 0 and 16383"})
+            block["hiveId"] = v
+        else:
+            block.setdefault("hiveId", 1)
+        cfg["persistence"] = block
+    else:
+        cfg.pop("persistence", None)
+    try:
+        write_config(cfg)
+        return jsonify({
+            "ok": True,
+            "restart_required": get_server_pid() is not None,
+            "enabled":           _persistence_enabled(cfg),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/persistence/flush", methods=["POST"])
+def api_persistence_flush():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    # Refuse to delete saves while the server is running — the game holds file
+    # handles and may rewrite them mid-flush, which leaves us with partials.
+    if get_server_pid():
+        return jsonify({"ok": False, "error": "Stop the server before flushing saves"})
+    try:
+        removed = _flush_saves()
+        return jsonify({"ok": True, "removed": removed, "saves": _scan_saves()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 @app.route("/api/mods/add", methods=["POST"])
 def api_mods_add():
     if not session.get("logged_in"):
@@ -993,7 +1177,7 @@ def api_start():
     if get_server_pid():
         return jsonify({"ok": False, "error": "Server is already running"})
     try:
-        subprocess.Popen([SERVER_BINARY] + SERVER_ARGS, cwd=SERVER_DIR,
+        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         time.sleep(1)
@@ -1030,7 +1214,7 @@ def api_restart():
         except Exception as e:
             return jsonify({"ok": False, "error": f"Stop failed: {e}"})
     try:
-        subprocess.Popen([SERVER_BINARY] + SERVER_ARGS, cwd=SERVER_DIR,
+        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         time.sleep(1)
