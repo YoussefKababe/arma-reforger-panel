@@ -685,10 +685,28 @@ def write_config(cfg):
 
 _SAVE_SUBDIRS = (".save", "save", "saves")
 
+def _get_persistence_block(cfg):
+    """Read the persistence block at its real schema location:
+    `game.gameProperties.persistence`. Returns the block dict or None."""
+    gp = (cfg.get("game") or {}).get("gameProperties") or {}
+    block = gp.get("persistence")
+    return block if isinstance(block, dict) else None
+
+def _set_persistence_block(cfg, block):
+    """Write `block` (a dict) at game.gameProperties.persistence, or remove it
+    if `block` is None. Also pops any legacy top-level `persistence` key — the
+    1.6 server schema rejects it, so its presence is always a bug."""
+    cfg.pop("persistence", None)
+    gp = cfg.setdefault("game", {}).setdefault("gameProperties", {})
+    if block is None:
+        gp.pop("persistence", None)
+    else:
+        gp["persistence"] = block
+
 def _persistence_enabled(cfg=None):
     if cfg is None:
         cfg = read_config()
-    return isinstance(cfg.get("persistence"), dict)
+    return _get_persistence_block(cfg) is not None
 
 # Subdirs the flush button targets. `settings/` is intentionally preserved
 # because it holds non-session config the server expects to regenerate from.
@@ -964,10 +982,10 @@ def api_persistence_get():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
     cfg = read_config()
-    block = cfg.get("persistence") if isinstance(cfg.get("persistence"), dict) else {}
+    block = _get_persistence_block(cfg) or {}
     saves = _scan_saves()
     return jsonify({
-        "enabled":         _persistence_enabled(cfg),
+        "enabled":          _persistence_enabled(cfg),
         "autoSaveInterval": block.get("autoSaveInterval", 10),
         "hiveId":           block.get("hiveId", 1),
         "saves":            saves,
@@ -984,7 +1002,7 @@ def api_persistence_set():
     cfg  = read_config()
     enabled = bool(data.get("enabled"))
     if enabled:
-        block = cfg.get("persistence") if isinstance(cfg.get("persistence"), dict) else {}
+        block = _get_persistence_block(cfg) or {}
         if "autoSaveInterval" in data:
             try:
                 v = int(data["autoSaveInterval"])
@@ -1005,9 +1023,9 @@ def api_persistence_set():
             block["hiveId"] = v
         else:
             block.setdefault("hiveId", 1)
-        cfg["persistence"] = block
+        _set_persistence_block(cfg, block)
     else:
-        cfg.pop("persistence", None)
+        _set_persistence_block(cfg, None)
     try:
         write_config(cfg)
         return jsonify({

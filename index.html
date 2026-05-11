@@ -606,10 +606,11 @@
     <div class="card-label">Persistence</div>
     <div style="font-size:11.5px;color:var(--muted);line-height:1.6;margin-bottom:14px;">
       Server launches always pass <code>-loadSessionSave</code>, so any existing save is loaded on
-      start. This toggle controls the <code>persistence</code> block in <code>config.json</code> —
-      enable it to autosave every N minutes, disable to stop writing new saves (existing saves still
-      load on start; use <strong>Flush saves</strong> to start fresh). Session save only works in
-      scenarios that implement it (Conflict, Combat Ops); Game Master needs manual saves from Esc.
+      start. This toggle writes the <code>game.gameProperties.persistence</code> block in
+      <code>config.json</code> — enable to autosave every N minutes, disable to stop writing new
+      saves (existing saves still load on start; use <strong>Flush saves</strong> to start fresh).
+      Session save only works in scenarios that implement it (Conflict, Combat Ops); Game Master
+      needs manual saves from Esc.
     </div>
     <div class="config-grid">
       <div class="field-group">
